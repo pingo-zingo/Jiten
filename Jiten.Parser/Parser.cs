@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -16,7 +16,6 @@ using Jiten.Parser.Resolution;
 using Jiten.Parser.Runtime;
 using Jiten.Parser.Scoring;
 using Microsoft.EntityFrameworkCore;
-using StackExchange.Redis;
 using WanaKanaShaapu;
 
 namespace Jiten.Parser
@@ -24,7 +23,7 @@ namespace Jiten.Parser
     /// <summary>One resolved token in text order, before per-deck deduplication into DeckWords.</summary>
     public sealed record ParsedOccurrence(int WordId, byte ReadingIndex, string Surface);
 
-    public static class Parser
+    public static partial class Parser
     {
         public static bool RubyPriorsEnabled
         {
@@ -39,16 +38,12 @@ namespace Jiten.Parser
         private static IJmDictCache JmDictCache = null!;
 
         private static IDbContextFactory<JitenDbContext> _contextFactory = null!;
-        private static Dictionary<string, List<int>> _lookups = null!;
-        private static Dictionary<int, int> _wordFrequencyRanks = null!;
-        private static HashSet<int> _nameOnlyWordIds = null!;
-        private static HashSet<int> _expressionWordIds = null!;
-        private static HashSet<int> _kanjiBackedWordIds = null!;
-        internal static Dictionary<int, Data.JmDictWordMeta> WordMeta = null!;
+        private static ILookupIndex _lookups = null!;
+        private static IReadOnlyDictionary<int, int> _wordFrequencyRanks = null!;
+        internal static IWordMetaIndex WordMeta = null!;
         private static Dictionary<string, Data.PartialKanaForm?> _partialKanaSpellings = new();
 
         private static int _maxLookupKeyLength;
-        private static Dictionary<string, List<int>>.AlternateLookup<ReadOnlySpan<char>> _lookupsAlt;
 
         private static FilteredHashSet? _compoundHashSet;
         private static long[]? _hashBasePowers;
@@ -122,24 +117,22 @@ namespace Jiten.Parser
             var runtime = await _parserRuntime.EnsureInitializedAsync(contextFactory, log);
             DeckWordCache = runtime.DeckWordCache;
             JmDictCache = runtime.JmDictCache;
-            _lookups = runtime.Lookups;
-            _lookupsAlt = _lookups.GetAlternateLookup<ReadOnlySpan<char>>();
-            _wordFrequencyRanks = runtime.WordFrequencyRanks;
+            var onlineIndex = new InMemoryParserIndex(runtime.Lookups, runtime.WordFrequencyRanks,
+                runtime.NameOnlyWordIds, runtime.ExpressionWordIds, runtime.KanjiBackedWordIds, runtime.WordMeta);
+            _lookups = onlineIndex;
+            _wordFrequencyRanks = onlineIndex;
+            WordMeta = onlineIndex;
             WordFrequencyPriors.Current = runtime.WordObservedFrequencies;
-            _nameOnlyWordIds = runtime.NameOnlyWordIds;
-            _expressionWordIds = runtime.ExpressionWordIds;
-            _kanjiBackedWordIds = runtime.KanjiBackedWordIds;
             _partialKanaSpellings = runtime.PartialKanaSpellings;
-            WordMeta = runtime.WordMeta;
             if (_compoundHashSet == null)
                 BuildCompoundHashSet();
         }
 
         private static void BuildCompoundHashSet()
         {
-            var set = new FilteredHashSet(_lookups.Count);
+            var set = new FilteredHashSet(_lookups.LookupKeyCount);
             int maxLen = 0;
-            foreach (var key in _lookups.Keys)
+            foreach (var key in _lookups.EnumerateKeys())
             {
                 set.Add(HiraRollingHash(key));
                 if (key.Length > maxLen) maxLen = key.Length;
@@ -391,7 +384,7 @@ namespace Jiten.Parser
                     if (joined.Length > 6)
                         continue;
 
-                    if (_lookups.TryGetValue(joined, out var ids) && ids.Any(id => _nameOnlyWordIds.Contains(id)))
+                    if (_lookups.TryGetValue(joined, out var ids) && ids.Any(id => WordMeta.IsNameOnly(id)))
                         confirmed.Add(joined);
                 }
             }
@@ -445,7 +438,7 @@ namespace Jiten.Parser
                 return null;
             }
 
-            static bool HasLookup(string key, Dictionary<string, List<int>> lookups)
+            static bool HasLookup(string key, ILookupIndex lookups)
             {
                 if (lookups.TryGetValue(key, out var ids) && ids.Count > 0)
                     return true;
@@ -640,7 +633,7 @@ namespace Jiten.Parser
                         }
 
                         if (cacheEntries.Count > 0)
-                            await DeckWordCache.SetManyAsync(cacheEntries, CommandFlags.FireAndForget);
+                            await DeckWordCache.SetManyAsync(cacheEntries, fireAndForget: true);
                     }
                     catch (Exception ex)
                     {
@@ -1158,13 +1151,14 @@ namespace Jiten.Parser
             IEnumerable<int> wordIds,
             ConcurrentDictionary<int, JmDictWord>? batchCache)
         {
+            var distinct = wordIds.Distinct().ToList();
+            WordMeta.PrefetchWordMetadata(distinct);
             if (batchCache == null)
             {
                 // PriorityOverrides are applied once at insert into the in-process JmDict cache.
-                return await JmDictCache.GetWordsAsync(wordIds);
+                return await JmDictCache.GetWordsAsync(distinct);
             }
 
-            var distinct = wordIds.Distinct().ToList();
             var result = new Dictionary<int, JmDictWord>(distinct.Count);
             var needed = new List<int>();
 
@@ -2320,6 +2314,7 @@ namespace Jiten.Parser
                                                                     string normalizedText)
         {
             var deconjugated = deconjugator.Deconjugate(normalizedText).ToList();
+            _lookups.PrefetchLookupKeys(deconjugated.Select(f => f.Text));
 
             // Deconjugating a katakana noun into a kanji word fabricates vocabulary (ハガナ → 剥ぐ); ヤバイ → やばい stays.
             bool katakanaNounSurface = wordInfo.IsKatakanaNounSurface;
@@ -3626,6 +3621,7 @@ namespace Jiten.Parser
         {
             if (!_lookups.TryGetValue(text, out var ids) || ids.Count == 0)
                 return -1;
+            WordMeta.PrefetchWordMetadata(ids);
             int best = -1;
             foreach (var id in ids)
             {
@@ -3675,8 +3671,9 @@ namespace Jiten.Parser
         // One id must be both non-name and non-archaic; script-blind since the uk delta (10) never crosses the floor.
         private static bool HasUsableCompoundEntry(List<int> ids)
         {
+            WordMeta.PrefetchWordMetadata(ids);
             foreach (var id in ids)
-                if (!_nameOnlyWordIds.Contains(id)
+                if (!WordMeta.IsNameOnly(id)
                     && WordMeta.TryGetValue(id, out var meta) && meta.GetPriorityScore(false) > ArchaicOnlyPriorityFloor)
                     return true;
             return false;
@@ -3779,6 +3776,7 @@ namespace Jiten.Parser
 
         private static bool AnyWithPos(List<int> ids, PartOfSpeech pos)
         {
+            WordMeta.PrefetchWordMetadata(ids);
             foreach (var id in ids)
                 if (WordMeta.TryGetValue(id, out var meta) && Array.IndexOf(meta.Pos, pos) >= 0)
                     return true;
@@ -3787,8 +3785,9 @@ namespace Jiten.Parser
 
         private static bool AnyNonNameWithPos(List<int> ids, PartOfSpeech pos)
         {
+            WordMeta.PrefetchWordMetadata(ids);
             foreach (var id in ids)
-                if (!_nameOnlyWordIds.Contains(id) && WordMeta.TryGetValue(id, out var meta)
+                if (!WordMeta.IsNameOnly(id) && WordMeta.TryGetValue(id, out var meta)
                                                    && Array.IndexOf(meta.Pos, pos) >= 0)
                     return true;
             return false;
@@ -3803,7 +3802,7 @@ namespace Jiten.Parser
                 long bestRank = long.MaxValue;
                 foreach (var id in ids)
                 {
-                    if (_nameOnlyWordIds.Contains(id)) continue;
+                    if (WordMeta.IsNameOnly(id)) continue;
                     long rank = _wordFrequencyRanks.TryGetValue(id, out var r) ? r : int.MaxValue;
                     // Ties break to the lowest WordId so the pin doesn't depend on _lookups' array_agg order.
                     if (bestId == null || rank < bestRank || (rank == bestRank && id < bestId))
@@ -3822,7 +3821,7 @@ namespace Jiten.Parser
                 int? best = null;
                 foreach (var id in ids)
                 {
-                    if (_nameOnlyWordIds.Contains(id)) continue;
+                    if (WordMeta.IsNameOnly(id)) continue;
                     if (_wordFrequencyRanks.TryGetValue(id, out var rank) && (best == null || rank < best))
                         best = rank;
                 }
@@ -3831,7 +3830,7 @@ namespace Jiten.Parser
 
         private static bool HasNonNameLookup(string text) =>
             HasLookupWhere(text, KanaFallback.ToNormalizedHiragana,
-                           static ids => ids.Exists(static id => !_nameOnlyWordIds.Contains(id)));
+                           static ids => { WordMeta.PrefetchWordMetadata(ids); return ids.Exists(static id => !WordMeta.IsNameOnly(id)); });
 
         // Separates a real conjugating lexeme from a homographic noun a deconjugation lands on (明日/あす).
         private static bool HasVerbOrAdjectiveLookup(string text) =>
@@ -3907,17 +3906,17 @@ namespace Jiten.Parser
         /// <summary>uk or kanji-less words; kanji-backed non-uk words (遺影) and name entries (ヒューン) reject.</summary>
         private static bool IsKanaAppropriateId(int id)
         {
-            if (_nameOnlyWordIds.Contains(id)) return false;
+            if (WordMeta.IsNameOnly(id)) return false;
             if (!WordMeta.TryGetValue(id, out var meta)) return false;
             if (meta.IsTrueName) return false;
 
             // uk is folded into priority scores at load: kana = base + 10, kanji = base - 10.
             bool isUsuallyKana = meta.PriorityScoreKana > meta.PriorityScoreKanji;
-            return isUsuallyKana || !_kanjiBackedWordIds.Contains(id);
+            return isUsuallyKana || !WordMeta.IsKanjiBacked(id);
         }
 
         private static bool HasKanaAppropriateLookup(string text) =>
-            HasLookupWhere(text, KanaFallback.ToNormalizedHiragana, static ids => ids.Exists(IsKanaAppropriateId));
+            HasLookupWhere(text, KanaFallback.ToNormalizedHiragana, static ids => { WordMeta.PrefetchWordMetadata(ids); return ids.Exists(IsKanaAppropriateId); });
 
         /// <summary>Whether a noun+する merge resolves through deconjugation (密着 yes, 大怪我 no).</summary>
         private static bool HasSuruVerbLookup(string text) =>
@@ -3925,8 +3924,11 @@ namespace Jiten.Parser
 
         private static bool HasPrioritizedNonNameLookup(string text) =>
             HasLookupWhere(text, KanaFallback.ToNormalizedHiragana, static ids =>
-                ids.Exists(static id => !_nameOnlyWordIds.Contains(id)
-                                        && WordMeta.TryGetValue(id, out var meta) && meta.GetPriorityScore(true) > 0));
+            {
+                WordMeta.PrefetchWordMetadata(ids);
+                return ids.Exists(static id => !WordMeta.IsNameOnly(id)
+                                        && WordMeta.TryGetValue(id, out var meta) && meta.GetPriorityScore(true) > 0);
+            });
 
         private static void StripTrailingParticles(List<SentenceInfo> sentences)
         {
@@ -4295,7 +4297,7 @@ namespace Jiten.Parser
             var nextWord = words[i + 1].word;
             var combinedText = word.Text + nextWord.Text;
             if (!_lookups.TryGetValue(combinedText, out var ids) || ids.Count == 0 ||
-                ids.All(id => _nameOnlyWordIds.Contains(id)) ||
+                ids.All(id => WordMeta.IsNameOnly(id)) ||
                 !ids.Any(id => WordMeta.TryGetValue(id, out var meta) && meta.Pos.Any(PosMapper.IsNounForCompounding)))
                 return false;
 
@@ -4697,7 +4699,7 @@ namespace Jiten.Parser
 
         private static bool IsExpressionLookupMatch(string text) =>
             HasLookupWhere(text, KanaFallback.ToHiraganaKeepLongVowelMark,
-                           static ids => ids.Exists(static id => _expressionWordIds.Contains(id)));
+                           static ids => ids.Exists(static id => WordMeta.IsExpression(id)));
 
         private static bool IsMultiWordAdverbMatch(string text) =>
             HasLookupWhere(text, KanaFallback.ToHiraganaKeepLongVowelMark,
@@ -5321,7 +5323,7 @@ namespace Jiten.Parser
 
                 int? exprWordId = null, compWordId = null;
 
-                if (_lookupsAlt.TryGetValue(candidateSpan, out var wordIds) && wordIds.Count > 0)
+                if (_lookups.TryGetValue(candidateSpan, out var wordIds) && wordIds.Count > 0)
                 {
                     // A kanji-numeral span is a number, never a JMnedict name (四万, 二十三).
                     bool numeralSpan = true;
@@ -5356,7 +5358,7 @@ namespace Jiten.Parser
                             char ch = hiraganaSpan[c];
                             if (ch >= 'ァ' && ch <= 'ヶ') hiraganaSpan[c] = (char)(ch - 0x60);
                         }
-                        if (_lookupsAlt.TryGetValue(hiraganaSpan, out var hiraWordIds) && hiraWordIds.Count > 0)
+                        if (_lookups.TryGetValue(hiraganaSpan, out var hiraWordIds) && hiraWordIds.Count > 0)
                         {
                             (exprWordId, compWordId) = CompoundWordSelector.FindCompoundWordIds(hiraWordIds, WordMeta, isKana: true);
                         }

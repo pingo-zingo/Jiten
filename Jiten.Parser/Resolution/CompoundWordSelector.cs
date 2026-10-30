@@ -1,3 +1,4 @@
+using Jiten.Parser;
 using Jiten.Core.Data;
 using Jiten.Parser.Data;
 
@@ -6,10 +7,17 @@ namespace Jiten.Parser.Resolution;
 internal static class CompoundWordSelector
 {
     public static (int? expressionWordId, int? compoundWordId) FindCompoundWordIds(
+        List<int> wordIds, Dictionary<int, JmDictWordMeta> wordMeta, bool isKana = true)
+        => FindCompoundWordIds(wordIds, new InMemoryWordMetaIndex(wordMeta), isKana);
+
+
+
+    public static (int? expressionWordId, int? compoundWordId) FindCompoundWordIds(
         List<int> wordIds,
-        Dictionary<int, JmDictWordMeta> wordMeta,
+        IWordMetaIndex wordMeta,
         bool isKana = true)
     {
+        wordMeta.PrefetchWordMetadata(wordIds);
         int? bestExprWordId = null;
         int bestExprScore = int.MinValue;
         int? bestCompWordId = null;

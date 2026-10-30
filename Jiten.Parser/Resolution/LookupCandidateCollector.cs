@@ -2,13 +2,28 @@ namespace Jiten.Parser.Resolution;
 
 internal static class LookupCandidateCollector
 {
+    public static bool HasAnyMatch(Dictionary<string, List<int>> lookups, string text, bool includeLongVowelStripped = false)
+        => HasAnyMatch(new InMemoryLookupIndex(lookups), text, includeLongVowelStripped);
+
+    public static List<int> CollectIds(Dictionary<string, List<int>> lookups, string text,
+        bool includeKanaNormalized = true, bool includeLongVowelStripped = false, Func<int, bool>? normalizedTierGate = null)
+        => CollectIds(new InMemoryLookupIndex(lookups), text, includeKanaNormalized, includeLongVowelStripped, normalizedTierGate);
+
+
+
     /// Checks whether any lookup variant (raw, hiragana, normalized, long-vowel-stripped) has at least one match.
     public static bool HasAnyMatch(
-        Dictionary<string, List<int>> lookups,
+        ILookupIndex lookups,
         string text,
         bool includeLongVowelStripped = false)
     {
-        if (lookups.TryGetValue(text, out var ids) && ids.Count > 0)
+        var prefetchHiragana = KanaConverter.ToHiragana(text, convertLongVowelMark: false);
+        var prefetchKeys = new List<string> { text, prefetchHiragana, KanaNormalizer.Normalize(prefetchHiragana) };
+        if (includeLongVowelStripped && text.Contains('ー'))
+            prefetchKeys.Add(KanaConverter.ToNormalizedHiragana(text.Replace("ー", "")));
+        lookups.PrefetchLookupKeys(prefetchKeys);
+
+        if (lookups.TryGetValue(text, out var ids) && ids is { Count: > 0 })
             return true;
 
         var hiragana = KanaConverter.ToHiragana(text, convertLongVowelMark: false);
@@ -35,12 +50,26 @@ internal static class LookupCandidateCollector
 
     /// <summary>normalizedTierGate filters normalized-only hits, which invent readings (いえー → いえい must not reach 遺影).</summary>
     public static List<int> CollectIds(
-        Dictionary<string, List<int>> lookups,
+        ILookupIndex lookups,
         string text,
         bool includeKanaNormalized = true,
         bool includeLongVowelStripped = false,
         Func<int, bool>? normalizedTierGate = null)
     {
+        var hiraForPrefetch = KanaConverter.ToHiragana(text, convertLongVowelMark: false);
+        var keysToPrefetch = new List<string> { text, hiraForPrefetch };
+        if (includeKanaNormalized)
+        {
+            var normalizedForPrefetch = KanaNormalizer.Normalize(hiraForPrefetch);
+            if (normalizedForPrefetch != hiraForPrefetch) keysToPrefetch.Add(normalizedForPrefetch);
+        }
+        if (includeLongVowelStripped && text.Contains('ー'))
+        {
+            var strippedForPrefetch = text.Replace("ー", "");
+            if (strippedForPrefetch.Length > 0) keysToPrefetch.Add(KanaConverter.ToHiragana(strippedForPrefetch));
+        }
+        lookups.PrefetchLookupKeys(keysToPrefetch);
+
         var seen = new HashSet<int>();
         var ids = new List<int>();
 

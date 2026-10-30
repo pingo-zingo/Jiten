@@ -1,3 +1,4 @@
+using Jiten.Parser;
 using Jiten.Core.Data;
 using Jiten.Core.Data.JMDict;
 using Jiten.Parser.Scoring;
@@ -18,9 +19,15 @@ internal static class RederivationHelper
         public bool IsVerbPath;
     }
 
+    public static RederiveState? CollectRederivationIds(WordInfo wordInfo,
+        Dictionary<string, List<int>> lookups, Deconjugator deconjugator)
+        => CollectRederivationIds(wordInfo, new InMemoryLookupIndex(lookups), deconjugator);
+
+
+
     public static RederiveState? CollectRederivationIds(
         WordInfo wordInfo,
-        Dictionary<string, List<int>> lookups,
+        ILookupIndex lookups,
         Deconjugator deconjugator)
     {
         var text = wordInfo.Text;
@@ -45,6 +52,7 @@ internal static class RederivationHelper
         {
             var normalizedText = KanaNormalizer.Normalize(KanaConverter.ToHiragana(text));
             var deconjugated = deconjugator.Deconjugate(normalizedText);
+            lookups.PrefetchLookupKeys(deconjugated.Select(d => d.Text));
 
             var deconjMatches = new List<(DeconjugationForm form, List<int> ids)>(deconjugated.Count);
             var seen = new HashSet<int>(candidateIds);

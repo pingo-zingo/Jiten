@@ -37,7 +37,14 @@ public static class SentenceDifficultyScorer
         SentenceInfo sentence,
         IReadOnlyList<(int Position, int WordId, byte ReadingIndex)> matchedWords,
         Dictionary<(int WordId, byte ReadingIndex), int> formFreqRanks,
-        Dictionary<int, int> wordFreqRanks)
+        Dictionary<int, int> wordFreqRanks) =>
+        Score(sentence, matchedWords, formFreqRanks, (IReadOnlyDictionary<int, int>)wordFreqRanks);
+
+    public static float Score(
+        SentenceInfo sentence,
+        IReadOnlyList<(int Position, int WordId, byte ReadingIndex)> matchedWords,
+        Dictionary<(int WordId, byte ReadingIndex), int> formFreqRanks,
+        IReadOnlyDictionary<int, int> wordFreqRanks)
     {
         var positionToMatch = new Dictionary<int, (int Position, int WordId, byte ReadingIndex)>();
         foreach (var mw in matchedWords)

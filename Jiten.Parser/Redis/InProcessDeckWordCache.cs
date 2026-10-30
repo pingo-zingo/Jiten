@@ -104,16 +104,16 @@ public sealed class InProcessDeckWordCache : IDeckWordCache
         return results;
     }
 
-    public Task SetAsync(DeckWordCacheKey key, DeckWord word, CommandFlags flags = CommandFlags.None)
+    public Task SetAsync(DeckWordCacheKey key, DeckWord word, bool fireAndForget = false)
     {
         Add(key, word.Clone());
-        return _inner.SetAsync(key, word, flags);
+        return _inner.SetAsync(key, word, fireAndForget);
     }
 
-    public Task SetManyAsync(IReadOnlyList<(DeckWordCacheKey key, DeckWord word)> entries, CommandFlags flags = CommandFlags.None)
+    public Task SetManyAsync(IReadOnlyList<(DeckWordCacheKey key, DeckWord word)> entries, bool fireAndForget = false)
     {
         foreach (var (key, word) in entries)
             Add(key, word.Clone());
-        return _inner.SetManyAsync(entries, flags);
+        return _inner.SetManyAsync(entries, fireAndForget);
     }
 }

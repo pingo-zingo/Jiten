@@ -1,3 +1,4 @@
+using Jiten.Parser;
 using Jiten.Core;
 using Jiten.Core.Data;
 using Jiten.Parser.Data;
@@ -8,9 +9,17 @@ internal static class VerbStemLookup
 {
     /// <summary>Most frequent verb whose bare 連用形 is <paramref name="surface"/> (回し → 回す, 答え → 答える); kana-only surfaces never match.</summary>
     public static (int WordId, string DictionaryForm)? Find(string surface, string reading,
-                                                            Dictionary<string, List<int>> lookups,
-                                                            Dictionary<int, JmDictWordMeta> wordMeta,
-                                                            Dictionary<int, int> frequencyRanks)
+        Dictionary<string, List<int>> lookups, Dictionary<int, JmDictWordMeta> wordMeta,
+        Dictionary<int, int> frequencyRanks)
+        => Find(surface, reading, new InMemoryLookupIndex(lookups),
+            new InMemoryWordMetaIndex(wordMeta), frequencyRanks);
+
+
+
+    public static (int WordId, string DictionaryForm)? Find(string surface, string reading,
+                                                            ILookupIndex lookups,
+                                                            IWordMetaIndex wordMeta,
+                                                            IReadOnlyDictionary<int, int> frequencyRanks)
     {
         if (surface.Length < 2 || !JapaneseTextHelper.IsHiragana(surface[^1])
                                || !surface.Any(JapaneseTextHelper.IsKanji))
@@ -33,6 +42,8 @@ internal static class VerbStemLookup
             if (readingHira != null && (readingDictForm == null || !lookups.TryGetValue(readingDictForm, out readingIds)))
                 return;
 
+            wordMeta.PrefetchWordMetadata(ids);
+            if (readingIds != null) wordMeta.PrefetchWordMetadata(readingIds);
             foreach (var id in ids)
             {
                 if (readingIds != null && !readingIds.Contains(id))

@@ -1,3 +1,4 @@
+using Jiten.Parser;
 using Jiten.Core;
 using Jiten.Core.Data;
 using Jiten.Parser.Data;
@@ -18,7 +19,17 @@ internal static class UncertaintyDetector
     ];
 
     public static List<UncertainSpan> FindSpans(SentenceInfo sentence, Dictionary<string, List<int>> lookups,
-        Dictionary<int, JmDictWordMeta>? wordMeta = null,
+        Dictionary<int, JmDictWordMeta>? wordMeta = null, HashSet<string>? protectedSurfaces = null)
+        => FindSpans(sentence, new InMemoryLookupIndex(lookups),
+            wordMeta == null ? null : new InMemoryWordMetaIndex(wordMeta), protectedSurfaces);
+
+    internal static bool HasMatch(string text, Dictionary<string, List<int>> lookups)
+        => HasMatch(text, new InMemoryLookupIndex(lookups));
+
+
+
+    public static List<UncertainSpan> FindSpans(SentenceInfo sentence, ILookupIndex lookups,
+        IWordMetaIndex? wordMeta = null,
         HashSet<string>? protectedSurfaces = null)
     {
         var result = new List<UncertainSpan>();
@@ -70,7 +81,7 @@ internal static class UncertaintyDetector
         return result;
     }
 
-    internal static bool HasMatch(string text, Dictionary<string, List<int>> lookups)
+    internal static bool HasMatch(string text, ILookupIndex lookups)
     {
         if (LookupCandidateCollector.HasAnyMatch(lookups, text, includeLongVowelStripped: true))
             return true;
@@ -93,8 +104,8 @@ internal static class UncertaintyDetector
     }
 
     // A verb/adjective-derived match means the token is not name-only, whatever the lookup entries say.
-    private static bool IsPureNameOnlyMatch(string text, Dictionary<string, List<int>> lookups,
-        Dictionary<int, JmDictWordMeta> wordMeta)
+    private static bool IsPureNameOnlyMatch(string text, ILookupIndex lookups,
+        IWordMetaIndex wordMeta)
     {
         string hira;
         try { hira = KanaConverter.ToNormalizedHiragana(text); }
@@ -123,20 +134,20 @@ internal static class UncertaintyDetector
         return any;
     }
 
-    private static bool HasGodanDictFormMatch(string text, Dictionary<string, List<int>> lookups)
+    private static bool HasGodanDictFormMatch(string text, ILookupIndex lookups)
     {
         var dictForm = MorphologicalAnalyser.TryGodanDictForm(text);
         return dictForm != null && lookups.TryGetValue(dictForm, out var ids) && ids.Count > 0;
     }
 
-    private static bool HasIchidanDictFormMatch(string text, Dictionary<string, List<int>> lookups)
+    private static bool HasIchidanDictFormMatch(string text, ILookupIndex lookups)
     {
         if (text.Length < 2) return false;
         var dictForm = text + "る";
         return lookups.TryGetValue(dictForm, out var ids) && ids.Count > 0;
     }
 
-    private static bool HasAdjSaNominalizationMatch(string text, Dictionary<string, List<int>> lookups)
+    private static bool HasAdjSaNominalizationMatch(string text, ILookupIndex lookups)
     {
         if (text.Length < 3 || text[^1] != 'さ') return false;
         var adjForm = text[..^1] + "い";

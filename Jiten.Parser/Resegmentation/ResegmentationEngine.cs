@@ -1,3 +1,4 @@
+using Jiten.Parser;
 using Jiten.Core;
 using Jiten.Core.Data;
 using Jiten.Parser.Data;
@@ -11,11 +12,20 @@ internal static class ResegmentationEngine
     private const int MinAcceptScore = 25;
     private const int MinAcceptScoreConfidence = 50;
 
+    public static void TryImproveUncertainSpans(List<SentenceInfo> sentences,
+        Dictionary<string, List<int>> lookups, Dictionary<int, int> frequencyRanks,
+        Dictionary<int, JmDictWordMeta> wordMeta, HashSet<string>? protectedSurfaces = null,
+        ParserDiagnostics? diagnostics = null)
+        => TryImproveUncertainSpans(sentences, new InMemoryLookupIndex(lookups), frequencyRanks,
+            new InMemoryWordMetaIndex(wordMeta), protectedSurfaces, diagnostics);
+
+
+
     public static void TryImproveUncertainSpans(
         List<SentenceInfo> sentences,
-        Dictionary<string, List<int>> lookups,
-        Dictionary<int, int> frequencyRanks,
-        Dictionary<int, JmDictWordMeta> wordMeta,
+        ILookupIndex lookups,
+        IReadOnlyDictionary<int, int> frequencyRanks,
+        IWordMetaIndex wordMeta,
         HashSet<string>? protectedSurfaces = null,
         ParserDiagnostics? diagnostics = null)
     {
@@ -80,7 +90,8 @@ internal static class ResegmentationEngine
 
         if (pending.Count == 0) return;
 
-        var allWordIds = pending.SelectMany(p => p.path.Segments.SelectMany(s => s.WordIds)).Distinct();
+        var allWordIds = pending.SelectMany(p => p.path.Segments.SelectMany(s => s.WordIds)).Distinct().ToArray();
+        wordMeta.PrefetchWordMetadata(allWordIds);
         var wordPosByWordId = new Dictionary<int, PartOfSpeech>();
         foreach (var id in allWordIds)
         {
@@ -99,12 +110,21 @@ internal static class ResegmentationEngine
         }
     }
 
+    public static bool TryResegmentLowConfidenceTokens(List<SentenceInfo> sentences,
+        Dictionary<string, List<int>> lookups, Dictionary<int, int> frequencyRanks,
+        Dictionary<(int sentenceIndex, int wordIndex), int?> marginMap,
+        Dictionary<int, JmDictWordMeta> wordMeta, ParserDiagnostics? diagnostics = null)
+        => TryResegmentLowConfidenceTokens(sentences, new InMemoryLookupIndex(lookups), frequencyRanks,
+            marginMap, new InMemoryWordMetaIndex(wordMeta), diagnostics);
+
+
+
     public static bool TryResegmentLowConfidenceTokens(
         List<SentenceInfo> sentences,
-        Dictionary<string, List<int>> lookups,
-        Dictionary<int, int> frequencyRanks,
+        ILookupIndex lookups,
+        IReadOnlyDictionary<int, int> frequencyRanks,
         Dictionary<(int sentenceIndex, int wordIndex), int?> marginMap,
-        Dictionary<int, JmDictWordMeta> wordMeta,
+        IWordMetaIndex wordMeta,
         ParserDiagnostics? diagnostics = null)
     {
         var pending = new List<(SentenceInfo sentence, UncertainSpan span, SpanPath path, PartOfSpeech? prevPos, PartOfSpeech? nextPos)>();
@@ -162,7 +182,8 @@ internal static class ResegmentationEngine
 
         if (pending.Count == 0) return false;
 
-        var allWordIds = pending.SelectMany(p => p.path.Segments.SelectMany(s => s.WordIds)).Distinct();
+        var allWordIds = pending.SelectMany(p => p.path.Segments.SelectMany(s => s.WordIds)).Distinct().ToArray();
+        wordMeta.PrefetchWordMetadata(allWordIds);
         var wordPosByWordId = new Dictionary<int, PartOfSpeech>();
         foreach (var id in allWordIds)
         {
@@ -186,8 +207,8 @@ internal static class ResegmentationEngine
     }
 
     // Splits at the last place marker (五十七 → 五十+七); a piece JMnedict has only as a name (二十三) splits further.
-    private static SpanPath? TrySplitCompoundNumeral(string text, Dictionary<string, List<int>> lookups,
-        Dictionary<int, JmDictWordMeta> wordMeta)
+    private static SpanPath? TrySplitCompoundNumeral(string text, ILookupIndex lookups,
+        IWordMetaIndex wordMeta)
     {
         for (int i = text.Length - 1; i >= 1; i--)
         {
@@ -220,8 +241,8 @@ internal static class ResegmentationEngine
     }
 
     // Drops all-Name/Unknown entries, including JMnedict "unclass" (五十五 "Isoi"), unlike IsTrueName.
-    private static List<int>? NonNameLookupIds(string text, Dictionary<string, List<int>> lookups,
-        Dictionary<int, JmDictWordMeta> wordMeta)
+    private static List<int>? NonNameLookupIds(string text, ILookupIndex lookups,
+        IWordMetaIndex wordMeta)
     {
         if (!lookups.TryGetValue(text, out var ids) || ids.Count == 0)
             return null;
@@ -232,7 +253,7 @@ internal static class ResegmentationEngine
     }
 
     // Short pure-name segments shred OOV names (ファルマ → ファ+ルマ); long ones are real (ラムシャーリー → ラム+シャーリー).
-    private static bool HasShortPureNameSegment(SpanPath path, Dictionary<int, JmDictWordMeta> wordMeta)
+    private static bool HasShortPureNameSegment(SpanPath path, IWordMetaIndex wordMeta)
     {
         foreach (var s in path.Segments)
         {
@@ -267,7 +288,7 @@ internal static class ResegmentationEngine
     ];
 
     private static bool HasNameSegmentOutsidePersonContext(
-        SpanPath path, UncertainSpan span, SentenceInfo sentence, Dictionary<int, JmDictWordMeta> wordMeta)
+        SpanPath path, UncertainSpan span, SentenceInfo sentence, IWordMetaIndex wordMeta)
     {
         // Re-splitting a name-only span into names is the intended outcome, whatever the context.
         if (span.NameOnly) return false;
@@ -315,7 +336,7 @@ internal static class ResegmentationEngine
 
     // A katakana-spelled conjugated word is one word (オカシクナイ → おかしい), never fragments like オカ|シク.
     private static bool IsKatakanaConjugatedWordSpelling(string text,
-        Dictionary<string, List<int>> lookups, Dictionary<int, JmDictWordMeta> wordMeta)
+        ILookupIndex lookups, IWordMetaIndex wordMeta)
     {
         if (text.Length < 3 || !JapaneseTextHelper.IsAllKatakana(text)) return false;
 
@@ -335,7 +356,7 @@ internal static class ResegmentationEngine
 
     // A repeated kana segment is one mimetic (ずりずり), except repeated interjections (はいはいはい) which stay split.
     private static bool IsReduplicatedKanaSplit(SpanPath path, string text,
-        Dictionary<int, JmDictWordMeta> wordMeta)
+        IWordMetaIndex wordMeta)
     {
         if (path.Segments.Count < 2) return false;
 
@@ -379,7 +400,7 @@ internal static class ResegmentationEngine
     private static readonly Dictionary<string, int> SegmentSurfacePins = new() { ["ナシ"] = 1529560, ["オラ"] = 2080360 };
 
     private static void ReplaceSpan(SentenceInfo sentence, UncertainSpan span, SpanPath path,
-        Dictionary<string, List<int>> lookups, Dictionary<int, int> frequencyRanks, Dictionary<int, JmDictWordMeta> wordMeta,
+        ILookupIndex lookups, IReadOnlyDictionary<int, int> frequencyRanks, IWordMetaIndex wordMeta,
         string source, int freqScore, int posScore, ParserDiagnostics? diagnostics)
     {
         if (path.Segments.Count == 0

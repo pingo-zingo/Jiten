@@ -18,6 +18,14 @@ public static partial class ExampleSentenceExtractor
         DeckWord[] words,
         Dictionary<(int WordId, byte ReadingIndex), int> formFreqRanks,
         Dictionary<int, int> wordFreqRanks,
+        bool subtitleSpeech = false) =>
+        ExtractSentences(sentences, words, formFreqRanks, (IReadOnlyDictionary<int, int>)wordFreqRanks, subtitleSpeech);
+
+    public static List<ExampleSentence> ExtractSentences(
+        List<SentenceInfo> sentences,
+        DeckWord[] words,
+        Dictionary<(int WordId, byte ReadingIndex), int> formFreqRanks,
+        IReadOnlyDictionary<int, int> wordFreqRanks,
         bool subtitleSpeech = false)
     {
         static bool IsPosMatch(DeckWord deckWord, WordInfo token)

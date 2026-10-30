@@ -1,3 +1,4 @@
+using Jiten.Parser;
 using Jiten.Core;
 using Jiten.Core.Data;
 using Jiten.Parser.Data;
@@ -18,13 +19,37 @@ internal static class ResegmentationScorer
 
     private static bool IsKatakanaRunChar(char c) => JapaneseTextHelper.IsKatakanaWordChar(c);
 
+    public static List<SpanTokenCandidate> BuildEdges(string spanText, int startPos, Dictionary<string, List<int>> lookups)
+        => BuildEdges(spanText, startPos, new InMemoryLookupIndex(lookups));
+
+    public static SpanPath? FindBestPath(string spanText, Dictionary<string, List<int>> lookups,
+        Dictionary<int, int>? frequencyRanks = null, int beamWidth = BeamWidth, bool forbidFullSpanEdge = false,
+        Dictionary<int, JmDictWordMeta>? wordMeta = null)
+        => FindBestPath(spanText, new InMemoryLookupIndex(lookups), frequencyRanks, beamWidth, forbidFullSpanEdge,
+            wordMeta == null ? null : new InMemoryWordMetaIndex(wordMeta));
+
+
+
     public static List<SpanTokenCandidate> BuildEdges(
         string spanText,
         int startPos,
-        Dictionary<string, List<int>> lookups)
+        ILookupIndex lookups)
     {
         var result = new List<SpanTokenCandidate>(MaxEdgesPerStart);
         int maxLen = Math.Min(MaxEdgeLength, spanText.Length - startPos);
+        var probeKeys = new List<string>(maxLen * 2);
+        for (int len = maxLen; len >= 1; len--)
+        {
+            var slice = spanText.Substring(startPos, len);
+            probeKeys.Add(slice);
+            try
+            {
+                var normalizedSlice = KanaConverter.ToNormalizedHiragana(slice);
+                if (normalizedSlice != slice) probeKeys.Add(normalizedSlice);
+            }
+            catch { }
+        }
+        lookups.PrefetchLookupKeys(probeKeys);
 
         for (int len = maxLen; len >= 1 && result.Count < MaxEdgesPerStart; len--)
         {
@@ -62,7 +87,7 @@ internal static class ResegmentationScorer
 
     // Verb-only matches (スク→空く) are never components; suffix-only (ディ→デー) only close a span, prefix-only only open one.
     private static bool IsPlausibleSegment(SpanTokenCandidate edge,
-        Dictionary<int, JmDictWordMeta> wordMeta, bool isFirst, bool isFinal)
+        IWordMetaIndex wordMeta, bool isFirst, bool isFinal)
     {
         foreach (var id in edge.WordIds)
         {
@@ -90,11 +115,11 @@ internal static class ResegmentationScorer
 
     public static SpanPath? FindBestPath(
         string spanText,
-        Dictionary<string, List<int>> lookups,
-        Dictionary<int, int>? frequencyRanks = null,
+        ILookupIndex lookups,
+        IReadOnlyDictionary<int, int>? frequencyRanks = null,
         int beamWidth = BeamWidth,
         bool forbidFullSpanEdge = false,
-        Dictionary<int, JmDictWordMeta>? wordMeta = null)
+        IWordMetaIndex? wordMeta = null)
     {
         if (spanText.Length == 0 || spanText.Length > MaxSpanLength)
             return null;
@@ -241,7 +266,7 @@ internal static class ResegmentationScorer
         return new SpanPath(validStates[0].segs);
     }
 
-    internal static int ScorePath(SpanPath path, Dictionary<int, int> frequencyRanks, string? spanText = null)
+    internal static int ScorePath(SpanPath path, IReadOnlyDictionary<int, int> frequencyRanks, string? spanText = null)
     {
         int score = 0;
         int totalLength = 0;
@@ -301,7 +326,7 @@ internal static class ResegmentationScorer
         Dictionary<int, PartOfSpeech> wordPosByWordId,
         PartOfSpeech? prevNeighborPos,
         PartOfSpeech? nextNeighborPos,
-        Dictionary<int, int>? frequencyRanks = null)
+        IReadOnlyDictionary<int, int>? frequencyRanks = null)
     {
         int score = 0;
 
@@ -344,7 +369,7 @@ internal static class ResegmentationScorer
     private static PartOfSpeech? ResolveSegmentPos(
         SpanTokenCandidate seg,
         Dictionary<int, PartOfSpeech> wordPosByWordId,
-        Dictionary<int, int>? frequencyRanks)
+        IReadOnlyDictionary<int, int>? frequencyRanks)
     {
         int bestRank = int.MaxValue;
         PartOfSpeech? bestPos = null;

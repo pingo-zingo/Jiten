@@ -77,15 +77,16 @@ public class RedisDeckWordCache : IDeckWordCache
         return results;
     }
 
-    public async Task SetAsync(DeckWordCacheKey key, DeckWord word, CommandFlags flags = CommandFlags.None)
+    public async Task SetAsync(DeckWordCacheKey key, DeckWord word, bool fireAndForget = false)
     {
         var redisKey = BuildRedisKey(key);
         var bytes = MessagePackSerializer.Serialize(word, MsgPackOptions);
 
-        await _redisDb.StringSetAsync(redisKey, bytes, expiry: TimeSpan.FromDays(30), flags: flags);
+        await _redisDb.StringSetAsync(redisKey, bytes, expiry: TimeSpan.FromDays(30),
+            flags: fireAndForget ? CommandFlags.FireAndForget : CommandFlags.None);
     }
 
-    public Task SetManyAsync(IReadOnlyList<(DeckWordCacheKey key, DeckWord word)> entries, CommandFlags flags = CommandFlags.None)
+    public Task SetManyAsync(IReadOnlyList<(DeckWordCacheKey key, DeckWord word)> entries, bool fireAndForget = false)
     {
         if (entries.Count == 0)
             return Task.CompletedTask;
@@ -95,7 +96,8 @@ public class RedisDeckWordCache : IDeckWordCache
         {
             var redisKey = BuildRedisKey(key);
             var bytes = MessagePackSerializer.Serialize(word, MsgPackOptions);
-            _ = batch.StringSetAsync(redisKey, bytes, expiry: TimeSpan.FromDays(30), flags: flags);
+            _ = batch.StringSetAsync(redisKey, bytes, expiry: TimeSpan.FromDays(30),
+                flags: fireAndForget ? CommandFlags.FireAndForget : CommandFlags.None);
         }
         batch.Execute();
         return Task.CompletedTask;
