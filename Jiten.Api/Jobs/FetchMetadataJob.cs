@@ -1,8 +1,10 @@
 using Hangfire;
 using Jiten.Core;
 using Jiten.Core.Data;
+using Jiten.Core.Data.MetadataEdits;
 using Jiten.Core.Data.Providers;
 using Jiten.Core.Data.WebNovel;
+using Jiten.Core.Services;
 using Jiten.Core.WebNovel;
 using Microsoft.EntityFrameworkCore;
 
@@ -29,13 +31,8 @@ public class FetchMetadataJob(
 
         try
         {
-            var deck = context.Decks
-                .Include(d => d.Links)
-                .Include(deck => deck.Titles)
-                .Include(d => d.DeckGenres)
-                .Include(d => d.DeckTags)
-                .Include(d => d.DictionaryEntries)
-                .First(d => d.DeckId == deckId);
+            var refetch = await BeginAsync(context, deckId);
+            var deck = refetch.Deck;
             if (!ExternalUrlParser.TryParseFirst(deck.Links, LinkType.Anilist, out var parsed))
                 throw new Exception($"No usable Anilist work link found for deck with ID {deckId}.");
 
@@ -46,33 +43,14 @@ public class FetchMetadataJob(
             if (metadata == null)
                 throw new Exception($"Metadata for Anilist ID {id} not found.");
 
-            if (deck.ReleaseDate == default && metadata.ReleaseDate != null)
-                deck.ReleaseDate = DateOnly.FromDateTime(metadata.ReleaseDate.Value);
-
-            if (string.IsNullOrEmpty(deck.Description))
-                deck.Description = metadata.Description?.Length > 2000 ? metadata.Description?[..2000] : metadata.Description;
-
             if (metadata.Rating != null)
                 deck.ExternalRating = (byte)metadata.Rating;
 
-            foreach (var alias in metadata.Aliases)
-            {
-                if (deck.Titles.All(t => !string.Equals(t.Title, alias, StringComparison.OrdinalIgnoreCase)))
-                    deck.Titles.Add(new DeckTitle(){DeckId = deck.DeckId, Title = alias, TitleType = DeckTitleType.Alias});
-            }
+            await MetadataProviderHelper.ApplyProviderMetadataAsync(context, deck, metadata, LinkType.Anilist, refetch.Exclusions);
 
-            MergeDictionaryEntries(deck, metadata.DictionaryEntries);
+            await ProcessRelationsAsync(context, refetch, metadata.Relations, logger);
 
-            await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, LinkType.Anilist);
-
-            // Process relations from metadata
-            if (metadata.Relations.Count > 0)
-            {
-                await MetadataProviderHelper.ProcessRelations(context, deckId, metadata.Relations, logger);
-                FranchiseSyncJob.Enqueue(backgroundJobs);
-            }
-
-            await context.SaveChangesAsync();
+            await CompleteAsync(context, refetch, LinkType.Anilist);
         }
         finally
         {
@@ -87,12 +65,8 @@ public class FetchMetadataJob(
 
         try
         {
-            var deck = context.Decks
-                .Include(d => d.Links)
-                .Include(deck => deck.Titles)
-                .Include(d => d.DeckGenres)
-                .Include(d => d.DeckTags)
-                .First(d => d.DeckId == deckId);
+            var refetch = await BeginAsync(context, deckId);
+            var deck = refetch.Deck;
             if (!ExternalUrlParser.TryParseFirst(deck.Links, LinkType.GoogleBooks, out var parsed))
                 throw new Exception($"No usable Google Books work link found for deck with ID {deckId}.");
 
@@ -103,24 +77,12 @@ public class FetchMetadataJob(
             if (metadata == null)
                 throw new Exception($"Metadata for Google Books ID {id} not found.");
 
-            if (deck.ReleaseDate == default && metadata.ReleaseDate != null)
-                deck.ReleaseDate = DateOnly.FromDateTime(metadata.ReleaseDate.Value);
-
-            if (string.IsNullOrEmpty(deck.Description))
-                deck.Description = metadata.Description?.Length > 2000 ? metadata.Description?[..2000] : metadata.Description;
-
             if (metadata.Rating != null)
                 deck.ExternalRating = (byte)metadata.Rating;
 
-            foreach (var alias in metadata.Aliases)
-            {
-                if (deck.Titles.All(t => !string.Equals(t.Title, alias, StringComparison.OrdinalIgnoreCase)))
-                    deck.Titles.Add(new DeckTitle(){DeckId = deck.DeckId, Title = alias, TitleType = DeckTitleType.Alias});
-            }
+            await MetadataProviderHelper.ApplyProviderMetadataAsync(context, deck, metadata, LinkType.GoogleBooks, refetch.Exclusions);
 
-            await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, LinkType.GoogleBooks);
-
-            await context.SaveChangesAsync();
+            await CompleteAsync(context, refetch, LinkType.GoogleBooks);
         }
         finally
         {
@@ -135,13 +97,8 @@ public class FetchMetadataJob(
 
         try
         {
-            var deck = context.Decks
-                .Include(d => d.Links)
-                .Include(deck => deck.Titles)
-                .Include(d => d.DeckGenres)
-                .Include(d => d.DeckTags)
-                .Include(d => d.DictionaryEntries)
-                .First(d => d.DeckId == deckId);
+            var refetch = await BeginAsync(context, deckId);
+            var deck = refetch.Deck;
             if (!ExternalUrlParser.TryParseFirst(deck.Links, LinkType.Vndb, out var parsed))
                 throw new Exception($"No usable VNDB visual novel link found for deck with ID {deckId}.");
 
@@ -152,41 +109,18 @@ public class FetchMetadataJob(
             if (metadata == null)
                 throw new Exception($"Metadata for VNDB ID {id} not found.");
 
-            if (deck.ReleaseDate == default && metadata.ReleaseDate != null)
-                deck.ReleaseDate = DateOnly.FromDateTime(metadata.ReleaseDate.Value);
-
-            if (string.IsNullOrEmpty(deck.Description))
-                deck.Description = metadata.Description?.Length > 2000 ? metadata.Description?[..2000] : metadata.Description;
-
             if (metadata.Rating != null)
                 deck.ExternalRating = (byte)metadata.Rating;
 
-            foreach (var alias in metadata.Aliases)
-            {
-                if (deck.Titles.All(t => !string.Equals(t.Title, alias, StringComparison.OrdinalIgnoreCase)))
-                    deck.Titles.Add(new DeckTitle(){DeckId = deck.DeckId, Title = alias, TitleType = DeckTitleType.Alias});
-            }
+            await MetadataProviderHelper.ApplyProviderMetadataAsync(context, deck, metadata, LinkType.Vndb, refetch.Exclusions);
 
-            MergeDictionaryEntries(deck, metadata.DictionaryEntries);
-
-            await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, LinkType.Vndb);
-
-            // Process relations from metadata
-            if (metadata.Relations.Count > 0)
-            {
-                await MetadataProviderHelper.ProcessRelations(context, deckId, metadata.Relations, logger);
-                FranchiseSyncJob.Enqueue(backgroundJobs);
-            }
+            await ProcessRelationsAsync(context, refetch, metadata.Relations, logger);
 
             // VNDB anime adaptations (from the database dump, matched to anime decks by MAL id)
             var animeRelations = MetadataProviderHelper.GetVndbAnimeRelations(id);
-            if (animeRelations.Count > 0)
-            {
-                await MetadataProviderHelper.ProcessRelations(context, deckId, animeRelations);
-                FranchiseSyncJob.Enqueue(backgroundJobs);
-            }
+            await ProcessRelationsAsync(context, refetch, animeRelations, null);
 
-            await context.SaveChangesAsync();
+            await CompleteAsync(context, refetch, LinkType.Vndb);
         }
         finally
         {
@@ -201,12 +135,8 @@ public class FetchMetadataJob(
 
         try
         {
-            var deck = context.Decks
-                .Include(d => d.Links)
-                .Include(d => d.Titles)
-                .Include(d => d.DeckGenres)
-                .Include(d => d.DeckTags)
-                .First(d => d.DeckId == deckId);
+            var refetch = await BeginAsync(context, deckId);
+            var deck = refetch.Deck;
             if (!ExternalUrlParser.TryParseFirst(deck.Links, LinkType.Tmdb, out var parsed))
                 throw new Exception($"No usable TMDB work link found for deck with ID {deckId}.");
 
@@ -230,24 +160,12 @@ public class FetchMetadataJob(
             if (metadata == null)
                 throw new Exception($"Metadata for TMDB ID {id} not found.");
 
-            if (deck.ReleaseDate == default && metadata.ReleaseDate != null)
-                deck.ReleaseDate = DateOnly.FromDateTime(metadata.ReleaseDate.Value);
-
-            if (string.IsNullOrEmpty(deck.Description))
-                deck.Description = metadata.Description?.Length > 2000 ? metadata.Description?[..2000] : metadata.Description;
-
             if (metadata.Rating != null)
                 deck.ExternalRating = (byte)metadata.Rating;
 
-            foreach (var alias in metadata.Aliases)
-            {
-                if (deck.Titles.All(t => !string.Equals(t.Title, alias, StringComparison.OrdinalIgnoreCase)))
-                    deck.Titles.Add(new DeckTitle(){DeckId = deck.DeckId, Title = alias, TitleType = DeckTitleType.Alias});
-            }
+            await MetadataProviderHelper.ApplyProviderMetadataAsync(context, deck, metadata, LinkType.Tmdb, refetch.Exclusions);
 
-            await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, LinkType.Tmdb);
-
-            await context.SaveChangesAsync();
+            await CompleteAsync(context, refetch, LinkType.Tmdb);
         }
         finally
         {
@@ -262,12 +180,8 @@ public class FetchMetadataJob(
 
         try
         {
-            var deck = context.Decks
-                .Include(d => d.Links)
-                .Include(d => d.Titles)
-                .Include(d => d.DeckGenres)
-                .Include(d => d.DeckTags)
-                .First(d => d.DeckId == deckId);
+            var refetch = await BeginAsync(context, deckId);
+            var deck = refetch.Deck;
             if (!ExternalUrlParser.TryParseFirst(deck.Links, LinkType.Igdb, out var parsed))
                 throw new Exception($"No usable IGDB game link found for deck with ID {deckId}.");
 
@@ -277,24 +191,12 @@ public class FetchMetadataJob(
             if (metadata == null)
                 throw new Exception($"Metadata for IGDB URL {url} not found.");
 
-            if (deck.ReleaseDate == default && metadata.ReleaseDate != null)
-                deck.ReleaseDate = DateOnly.FromDateTime(metadata.ReleaseDate.Value);
-
-            if (string.IsNullOrEmpty(deck.Description))
-                deck.Description = metadata.Description?.Length > 2000 ? metadata.Description?[..2000] : metadata.Description;
-
             if (metadata.Rating != null)
                 deck.ExternalRating = (byte)metadata.Rating;
 
-            foreach (var alias in metadata.Aliases)
-            {
-                if (deck.Titles.All(t => !string.Equals(t.Title, alias, StringComparison.OrdinalIgnoreCase)))
-                    deck.Titles.Add(new DeckTitle(){DeckId = deck.DeckId, Title = alias, TitleType = DeckTitleType.Alias});
-            }
+            await MetadataProviderHelper.ApplyProviderMetadataAsync(context, deck, metadata, LinkType.Igdb, refetch.Exclusions);
 
-            await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, LinkType.Igdb);
-
-            await context.SaveChangesAsync();
+            await CompleteAsync(context, refetch, LinkType.Igdb);
         }
         finally
         {
@@ -309,13 +211,8 @@ public class FetchMetadataJob(
 
         try
         {
-            var deck = context.Decks
-                .Include(d => d.Links)
-                .Include(d => d.Titles)
-                .Include(d => d.DeckGenres)
-                .Include(d => d.DeckTags)
-                .Include(d => d.DictionaryEntries)
-                .First(d => d.DeckId == deckId);
+            var refetch = await BeginAsync(context, deckId);
+            var deck = refetch.Deck;
             if (!ExternalUrlParser.TryParseFirst(deck.Links, LinkType.Mal, out var parsed))
                 throw new Exception($"No usable MAL work link found for deck with ID {deckId}.");
 
@@ -329,32 +226,14 @@ public class FetchMetadataJob(
             if (metadata == null)
                 throw new Exception($"Metadata for MAL ID {malId} not found.");
 
-            if (deck.ReleaseDate == default && metadata.ReleaseDate != null)
-                deck.ReleaseDate = DateOnly.FromDateTime(metadata.ReleaseDate.Value);
-
-            if (string.IsNullOrEmpty(deck.Description))
-                deck.Description = metadata.Description?.Length > 2000 ? metadata.Description?[..2000] : metadata.Description;
-
             if (metadata.Rating != null)
                 deck.ExternalRating = (byte)metadata.Rating;
 
-            foreach (var alias in metadata.Aliases)
-            {
-                if (deck.Titles.All(t => !string.Equals(t.Title, alias, StringComparison.OrdinalIgnoreCase)))
-                    deck.Titles.Add(new DeckTitle { DeckId = deck.DeckId, Title = alias, TitleType = DeckTitleType.Alias });
-            }
+            await MetadataProviderHelper.ApplyProviderMetadataAsync(context, deck, metadata, LinkType.Mal, refetch.Exclusions);
 
-            MergeDictionaryEntries(deck, metadata.DictionaryEntries);
+            await ProcessRelationsAsync(context, refetch, metadata.Relations, logger);
 
-            await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, LinkType.Mal);
-
-            if (metadata.Relations.Count > 0)
-            {
-                await MetadataProviderHelper.ProcessRelations(context, deckId, metadata.Relations, logger);
-                FranchiseSyncJob.Enqueue(backgroundJobs);
-            }
-
-            await context.SaveChangesAsync();
+            await CompleteAsync(context, refetch, LinkType.Mal);
         }
         finally
         {
@@ -363,72 +242,74 @@ public class FetchMetadataJob(
     }
 
     /// <summary>
-    /// Refreshes a tracked webnovel from the source's metadata API
+    /// Refreshes a webnovel deck from its source. <paramref name="provider"/> only routes the job to the site's
+    /// queue; <see cref="WebNovelDeckWork.ResolveAsync"/> decides the work fetched.
     /// </summary>
-    [Queue(WebNovelQueues.SyosetuMetadata)]
-    public async Task FetchSyosetuMissingMetadata(int deckId)
+    [WebNovelQueue(WebNovelQueueKind.Metadata)]
+    public async Task FetchWebNovelMetadata(WebNovelProvider provider, int deckId)
     {
         await using var context = await contextFactory.CreateDbContextAsync();
 
-        var deck = await context.Decks
-                                .Include(d => d.Links)
-                                .Include(d => d.Titles)
-                                .Include(d => d.DeckGenres)
-                                .Include(d => d.DeckTags)
-                                .FirstAsync(d => d.DeckId == deckId);
+        var refetch = await BeginAsync(context, deckId);
+        var deck = refetch.Deck;
 
-        var (provider, sourceId) = await ResolveWebNovelWork(context, deck);
+        var work = await WebNovelDeckWork.ResolveAsync(context, deck.DeckId, deck.Links)
+                   ?? throw new Exception($"Deck {deck.DeckId} has no webnovel work link.");
 
-        var info = await sourceResolver.Resolve(provider).GetInfoAsync(sourceId);
+        var linkType = WebNovelProviders.Get(work.Provider).LinkType;
+        var info = await sourceResolver.Resolve(work.Provider).GetInfoAsync(work.SourceId);
         var metadata = info.ToMetadata();
 
-        if (deck.ReleaseDate == default && metadata.ReleaseDate != null)
-            deck.ReleaseDate = DateOnly.FromDateTime(metadata.ReleaseDate.Value);
+        if (deck.Links.All(l => l.LinkType != linkType))
+            deck.Links.Add(new Link { DeckId = deck.DeckId, LinkType = linkType, Url = info.Url });
 
-        if (string.IsNullOrEmpty(deck.Description))
-            deck.Description = metadata.Description?.Length > 2000 ? metadata.Description?[..2000] : metadata.Description;
+        await MetadataProviderHelper.ApplyProviderMetadataAsync(context, deck, metadata, linkType, refetch.Exclusions);
 
-        if (deck.Links.All(l => l.LinkType != LinkType.Syosetsu))
-            deck.Links.Add(new Link { DeckId = deck.DeckId, LinkType = LinkType.Syosetsu, Url = info.Url });
+        await CompleteAsync(context, refetch, linkType);
+    }
 
-        await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, LinkType.Syosetsu);
+    private sealed record Refetch(Deck Deck, DeckMetadataSnapshot Before, DeckMetadataExclusionSet Exclusions)
+    {
+        public bool RelationsChanged { get; set; }
+    }
+
+    private async Task ProcessRelationsAsync(JitenDbContext context, Refetch refetch, List<MetadataRelation> relations, ILogger? log)
+    {
+        if (relations.Count == 0)
+            return;
+        await MetadataProviderHelper.ProcessRelations(context, refetch.Deck.DeckId, relations, log);
+        refetch.RelationsChanged = true;
+        FranchiseSyncJob.Enqueue(backgroundJobs);
+    }
+
+    /// <summary>Loads every navigation <see cref="DeckMetadataSnapshot.Capture"/> reads, so the provider history row sees the whole before state.</summary>
+    private static async Task<Refetch> BeginAsync(JitenDbContext context, int deckId)
+    {
+        var deck = await context.Decks.IncludeSnapshotGraph().FirstAsync(d => d.DeckId == deckId);
+
+        var exclusions = await DeckMetadataExclusionSet.LoadAsync(context, deckId);
+        return new Refetch(deck, DeckMetadataSnapshot.Capture(deck), exclusions);
+    }
+
+    /// <summary>Saves the refetch with one provider history row when it changed anything; LastUpdate stays put because bulk re-imports gate on it.</summary>
+    private static async Task CompleteAsync(JitenDbContext context, Refetch refetch, LinkType provider)
+    {
+        var deck = refetch.Deck;
+
+        var unloadedTagIds = deck.DeckTags.Where(t => t.Tag == null).Select(t => t.TagId).Distinct().ToList();
+        if (unloadedTagIds.Count > 0)
+            await context.Tags.Where(t => unloadedTagIds.Contains(t.TagId)).LoadAsync();
+
+        if (refetch.RelationsChanged)
+        {
+            await context.Entry(deck).Collection(d => d.RelationshipsAsSource).Query().Include(r => r.TargetDeck).LoadAsync();
+            await context.Entry(deck).Collection(d => d.RelationshipsAsTarget).Query().Include(r => r.SourceDeck).LoadAsync();
+        }
+
+        var edit = MetadataEditLog.ProviderEdit(deck.DeckId, provider, refetch.Before, DeckMetadataSnapshot.Capture(deck));
+        if (edit != null)
+            context.MetadataEdits.Add(edit);
 
         await context.SaveChangesAsync();
-    }
-
-    /// <summary>
-    /// The ledger is the authority on which work a deck came from; the link is the fallback for a webnovel
-    /// deck that was added by hand rather than imported.
-    /// </summary>
-    private static async Task<(WebNovelProvider Provider, string SourceId)> ResolveWebNovelWork(JitenDbContext context, Deck deck)
-    {
-        var tracked = await context.WebNovelSources
-                                   .AsNoTracking()
-                                   .FirstOrDefaultAsync(s => s.DeckId == deck.DeckId);
-
-        if (tracked != null)
-            return (tracked.Provider, tracked.SourceId);
-
-        var link = deck.Links.FirstOrDefault(l => l.LinkType == LinkType.Syosetsu);
-
-        if (link == null)
-            throw new Exception($"No Syosetsu link found for deck with ID {deck.DeckId}.");
-
-        if (!WebNovelUrlParser.TryParse(link.Url, out var provider, out var sourceId))
-            throw new Exception($"Syosetsu link '{link.Url}' on deck {deck.DeckId} is not a work URL.");
-
-        return (provider, sourceId);
-    }
-
-    private static void MergeDictionaryEntries(Deck deck, List<DeckDictionaryEntry> entries)
-    {
-        foreach (var entry in entries)
-        {
-            if (deck.DictionaryEntries.All(e => e.Surface != entry.Surface))
-            {
-                entry.DeckId = deck.DeckId;
-                deck.DictionaryEntries.Add(entry);
-            }
-        }
     }
 }

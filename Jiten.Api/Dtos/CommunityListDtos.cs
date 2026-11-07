@@ -10,6 +10,10 @@ public class CommunityListSummaryDto
     public string Name { get; set; } = "";
     public string? Description { get; set; }
     public string? OwnerDisplayName { get; set; }
+
+    /// <summary>True when the owner's profile is public, or the viewer is the owner; friends-only profiles stay unlinked.</summary>
+    public bool CanOpenOwnerProfile { get; set; }
+
     public List<Genre> Genres { get; set; } = [];
     public List<TagDto> Tags { get; set; } = [];
     public int FavouriteCount { get; set; }
@@ -86,10 +90,49 @@ public class CommunityListQuotaDto
     public bool CanCreate { get; set; }
 }
 
+public class CommunityListProfileDto
+{
+    public List<CommunityListSummaryDto> Written { get; set; } = [];
+
+    /// <summary>Null when the owner keeps favourited lists from this viewer.</summary>
+    public List<CommunityListSummaryDto>? Favourited { get; set; }
+}
+
 public class CommunityListMineDto
 {
     public List<CommunityListSummaryDto> Lists { get; set; } = [];
     public required CommunityListQuotaDto Quota { get; set; }
+}
+
+public class CommunityListMembershipDto
+{
+    public int ListId { get; set; }
+    public required string Slug { get; set; }
+    public required string Name { get; set; }
+    public CommunityListStatus Status { get; set; }
+    public int ItemCount { get; set; }
+
+    /// <summary>How many of the asked titles the list already holds.</summary>
+    public int Contained { get; set; }
+}
+
+public class CommunityListMembershipResponse
+{
+    public List<CommunityListMembershipDto> Lists { get; set; } = [];
+    public required CommunityListQuotaDto Quota { get; set; }
+}
+
+public class CommunityListMembershipRequest
+{
+    public List<int> DeckIds { get; set; } = [];
+}
+
+public class AddCommunityListItemsRequest
+{
+    public List<CommunityListItemInput> Items { get; set; } = [];
+
+    /// <summary>Zero-based slot for the first new item; null or past the end appends.</summary>
+    public int? Position { get; set; }
 }
 
 public class CommunityListEditItemDto

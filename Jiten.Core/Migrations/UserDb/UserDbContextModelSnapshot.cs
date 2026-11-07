@@ -18,7 +18,7 @@ namespace Jiten.Core.Migrations.UserDb
 #pragma warning disable 612, 618
             modelBuilder
                 .HasDefaultSchema("user")
-                .HasAnnotation("ProductVersion", "9.0.2")
+                .HasAnnotation("ProductVersion", "10.0.14")
                 .HasAnnotation("Relational:MaxIdentifierLength", 63);
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
@@ -721,6 +721,49 @@ namespace Jiten.Core.Migrations.UserDb
                     b.ToTable("UserReviewDailies", "user");
                 });
 
+            modelBuilder.Entity("Jiten.Core.Data.User.FsrsParameterHistory", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<double?>("Loss")
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("ParametersJson")
+                        .IsRequired()
+                        .HasColumnType("jsonb");
+
+                    b.Property<double?>("PreviousLoss")
+                        .HasColumnType("double precision");
+
+                    b.Property<DateTime?>("RevertedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("ReviewCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Source")
+                        .HasColumnType("integer");
+
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid");
+
+                    b.Property<int>("Version")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("UserId", "CreatedAtUtc");
+
+                    b.ToTable("FsrsParameterHistories", "user");
+                });
+
             modelBuilder.Entity("Jiten.Core.Data.User.UserCardMedia", b =>
                 {
                     b.Property<long>("Id")
@@ -869,15 +912,36 @@ namespace Jiten.Core.Migrations.UserDb
                     b.Property<Guid>("UserId")
                         .HasColumnType("uuid");
 
+                    b.Property<bool>("AutoOptimise")
+                        .HasColumnType("boolean");
+
+                    b.Property<DateTime?>("AutoOptimiseAttemptedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("AutoOptimiseAttemptedReviewCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("AutoOptimiseLastOutcome")
+                        .HasColumnType("integer");
+
                     b.Property<double?>("DesiredRetention")
                         .HasColumnType("double precision");
 
                     b.Property<int?>("NewCardCursorStudyDeckId")
                         .HasColumnType("integer");
 
+                    b.Property<DateTime?>("ParametersFittedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("ParametersFittedReviewCount")
+                        .HasColumnType("integer");
+
                     b.Property<string>("ParametersJson")
                         .IsRequired()
                         .HasColumnType("jsonb");
+
+                    b.Property<int>("ParametersSource")
+                        .HasColumnType("integer");
 
                     b.Property<string>("PreviousParametersJson")
                         .HasColumnType("jsonb");
@@ -1164,6 +1228,18 @@ namespace Jiten.Core.Migrations.UserDb
                     b.Property<bool>("IsIgnored")
                         .HasColumnType("boolean");
 
+                    b.Property<bool>("IsPrivate")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("boolean")
+                        .HasDefaultValue(false);
+
+                    b.Property<string>("Note")
+                        .HasMaxLength(500)
+                        .HasColumnType("character varying(500)");
+
+                    b.Property<short?>("Score")
+                        .HasColumnType("smallint");
+
                     b.Property<int>("Status")
                         .HasColumnType("integer");
 
@@ -1187,6 +1263,25 @@ namespace Jiten.Core.Migrations.UserDb
                         .HasDatabaseName("IX_UserDeckPreference_UserId_Status");
 
                     b.ToTable("UserDeckPreferences", "user");
+                });
+
+            modelBuilder.Entity("Jiten.Core.Data.UserFavouriteWord", b =>
+                {
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid");
+
+                    b.Property<int>("WordId")
+                        .HasColumnType("integer");
+
+                    b.Property<byte>("ReadingIndex")
+                        .HasColumnType("smallint");
+
+                    b.Property<short>("Position")
+                        .HasColumnType("smallint");
+
+                    b.HasKey("UserId", "WordId", "ReadingIndex");
+
+                    b.ToTable("UserFavouriteWords", "user");
                 });
 
             modelBuilder.Entity("Jiten.Core.Data.UserKanjiGrid", b =>
@@ -1328,10 +1423,46 @@ namespace Jiten.Core.Migrations.UserDb
                     b.ToTable("UserMetadatas", "user");
                 });
 
+            modelBuilder.Entity("Jiten.Core.Data.UserPinnedDeck", b =>
+                {
+                    b.Property<Guid>("UserId")
+                        .HasColumnType("uuid");
+
+                    b.Property<int>("DeckId")
+                        .HasColumnType("integer");
+
+                    b.Property<short>("Position")
+                        .HasColumnType("smallint");
+
+                    b.HasKey("UserId", "DeckId");
+
+                    b.ToTable("UserPinnedDecks", "user");
+                });
+
             modelBuilder.Entity("Jiten.Core.Data.UserProfile", b =>
                 {
                     b.Property<Guid>("UserId")
                         .HasColumnType("uuid");
+
+                    b.Property<string>("AvatarColour")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<string>("AvatarKanji")
+                        .HasMaxLength(2)
+                        .HasColumnType("character varying(2)");
+
+                    b.Property<string>("AvatarStyle")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<string>("Bio")
+                        .HasMaxLength(200)
+                        .HasColumnType("character varying(200)");
+
+                    b.Property<string>("HeaderColour")
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
 
                     b.Property<bool>("IsMediaListPublic")
                         .ValueGeneratedOnAdd()
@@ -1342,6 +1473,18 @@ namespace Jiten.Core.Migrations.UserDb
                         .ValueGeneratedOnAdd()
                         .HasColumnType("boolean")
                         .HasDefaultValue(false);
+
+                    b.Property<string>("LinksJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("[]");
+
+                    b.Property<string>("PrivacyJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("{}");
 
                     b.HasKey("UserId");
 
@@ -1376,6 +1519,12 @@ namespace Jiten.Core.Migrations.UserDb
                         .ValueGeneratedOnAdd()
                         .HasColumnType("jsonb")
                         .HasDefaultValue("{}");
+
+                    b.Property<string>("MutedNotificationGroupsJson")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("jsonb")
+                        .HasDefaultValue("[]");
 
                     b.Property<string>("SmartDeckJson")
                         .IsRequired()
@@ -1641,6 +1790,15 @@ namespace Jiten.Core.Migrations.UserDb
                         .IsRequired();
                 });
 
+            modelBuilder.Entity("Jiten.Core.Data.User.FsrsParameterHistory", b =>
+                {
+                    b.HasOne("Jiten.Core.Data.Authentication.User", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
             modelBuilder.Entity("Jiten.Core.Data.User.UserCardMedia", b =>
                 {
                     b.HasOne("Jiten.Core.Data.Authentication.User", null)
@@ -1749,6 +1907,15 @@ namespace Jiten.Core.Migrations.UserDb
                     b.Navigation("CurrentEntry");
                 });
 
+            modelBuilder.Entity("Jiten.Core.Data.UserFavouriteWord", b =>
+                {
+                    b.HasOne("Jiten.Core.Data.Authentication.User", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
             modelBuilder.Entity("Jiten.Core.Data.UserKanjiGrid", b =>
                 {
                     b.HasOne("Jiten.Core.Data.Authentication.User", null)
@@ -1779,6 +1946,15 @@ namespace Jiten.Core.Migrations.UserDb
                     b.HasOne("Jiten.Core.Data.Authentication.User", null)
                         .WithOne()
                         .HasForeignKey("Jiten.Core.Data.UserMetadata", "UserId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("Jiten.Core.Data.UserPinnedDeck", b =>
+                {
+                    b.HasOne("Jiten.Core.Data.Authentication.User", null)
+                        .WithMany()
+                        .HasForeignKey("UserId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });

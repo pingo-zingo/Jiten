@@ -329,8 +329,7 @@ public partial class StudyController
 
             if (c.State is FsrsState.New or FsrsState.Learning or FsrsState.Relearning) learning.Add((key, occ));
             else if (c.State == FsrsState.Mastered) mature.Add((key, occ));
-            // Maturity mirrors the deck stats: interval = due - last review, mature at 21 days.
-            else if (c.LastReview.HasValue && (c.Due - c.LastReview.Value).TotalDays >= 21) mature.Add((key, occ));
+            else if (KnownWordRules.IsMatureInterval(c.Due, c.LastReview)) mature.Add((key, occ));
             else young.Add((key, occ));
         }
 
@@ -549,7 +548,7 @@ public partial class StudyController
         try
         {
             var value = await redis.GetDatabase().StringGetAsync(cacheKey);
-            return value.HasValue ? JsonSerializer.Deserialize<T>(value!) : null;
+            return value.HasValue ? JsonSerializer.Deserialize<T>((string)value!) : null;
         }
         catch (Exception ex)
         {

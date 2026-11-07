@@ -1,6 +1,7 @@
 using Jiten.Core.Data;
 using Jiten.Core.Data.CommunityLists;
 using Jiten.Core.Data.JMDict;
+using Jiten.Core.Data.MetadataEdits;
 using Jiten.Core.Data.WebNovel;
 using Jiten.Core.Data.YouTube;
 using Microsoft.Extensions.Configuration;
@@ -93,6 +94,11 @@ public class JitenDbContext : DbContext
     public DbSet<MediaRequestUpload> MediaRequestUploads { get; set; }
     public DbSet<RequestActivityLog> RequestActivityLogs { get; set; }
     public DbSet<Notification> Notifications { get; set; }
+    public DbSet<MetadataEdit> MetadataEdits { get; set; }
+    public DbSet<MetadataEditCheck> MetadataEditChecks { get; set; }
+    public DbSet<DeckMetadataExclusion> DeckMetadataExclusions { get; set; }
+    public DbSet<MetadataEditSettings> MetadataEditSettings { get; set; }
+    public DbSet<MetadataContributor> MetadataContributors { get; set; }
     public DbSet<SiteUpdate> SiteUpdates { get; set; }
 
     public DbSet<Poll> Polls { get; set; }
@@ -361,6 +367,10 @@ public class JitenDbContext : DbContext
 
             entity.HasIndex(c => c.ChildDeckId)
                   .HasDatabaseName("IX_WebNovelChapters_ChildDeckId");
+
+            entity.HasIndex(c => new { c.DeckId, c.SourceEpisodeId })
+                  .IsUnique()
+                  .HasDatabaseName("IX_WebNovelChapters_DeckId_SourceEpisodeId");
         });
 
         modelBuilder.Entity<YouTubeSource>(entity =>
@@ -615,11 +625,13 @@ public class JitenDbContext : DbContext
             {
                 entity.Property(e => e.Priorities).HasColumnType("text[]").IsRequired(false);
                 entity.Property(e => e.InfoTags).HasColumnType("text[]").IsRequired(false);
+                entity.Property(e => e.PitchAccents).HasColumnType("int[]").IsRequired(false);
             }
             else
             {
                 entity.Property(e => e.Priorities).IsRequired(false);
                 entity.Property(e => e.InfoTags).IsRequired(false);
+                entity.Property(e => e.PitchAccents).IsRequired(false);
             }
 
             entity.HasIndex(e => new { e.WordId, e.FormType, e.Text })
@@ -987,6 +999,65 @@ public class JitenDbContext : DbContext
                   .OnDelete(DeleteBehavior.Cascade);
 
             entity.HasIndex(o => o.HighDeckId).HasDatabaseName("IX_DeckRelationshipOverrides_HighDeckId");
+        });
+
+        modelBuilder.Entity<MetadataEdit>(entity =>
+        {
+            entity.ToTable("MetadataEdits", "jiten");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Fields).HasConversion<int>();
+            if (isNpgsql)
+            {
+                entity.Property(e => e.ChangesJson).HasColumnType("jsonb");
+                entity.Property(e => e.SourcesJson).HasColumnType("jsonb");
+            }
+
+            entity.HasOne(e => e.Deck)
+                  .WithMany()
+                  .HasForeignKey(e => e.DeckId)
+                  .OnDelete(DeleteBehavior.Cascade);
+
+            entity.HasIndex(e => new { e.Status, e.CreatedAt }).HasDatabaseName("IX_MetadataEdits_Status_CreatedAt");
+            entity.HasIndex(e => new { e.DeckId, e.CreatedAt }).HasDatabaseName("IX_MetadataEdits_DeckId_CreatedAt");
+            entity.HasIndex(e => new { e.UserId, e.CreatedAt }).HasDatabaseName("IX_MetadataEdits_UserId_CreatedAt");
+            entity.HasIndex(e => e.SubmissionId).HasDatabaseName("IX_MetadataEdits_SubmissionId");
+        });
+
+        modelBuilder.Entity<MetadataEditCheck>(entity =>
+        {
+            entity.ToTable("MetadataEditChecks", "jiten");
+            entity.HasKey(c => c.Id);
+            entity.HasOne(c => c.Edit)
+                  .WithMany(e => e.Checks)
+                  .HasForeignKey(c => c.MetadataEditId)
+                  .OnDelete(DeleteBehavior.Cascade);
+            entity.HasIndex(c => new { c.MetadataEditId, c.UserId }).IsUnique().HasDatabaseName("IX_MetadataEditChecks_Edit_User");
+            entity.HasIndex(c => new { c.UserId, c.CreatedAt }).HasDatabaseName("IX_MetadataEditChecks_UserId_CreatedAt");
+        });
+
+        modelBuilder.Entity<DeckMetadataExclusion>(entity =>
+        {
+            entity.ToTable("DeckMetadataExclusions", "jiten");
+            entity.HasKey(x => x.Id);
+            entity.HasOne<Deck>()
+                  .WithMany()
+                  .HasForeignKey(x => x.DeckId)
+                  .OnDelete(DeleteBehavior.Cascade);
+            entity.HasIndex(x => new { x.DeckId, x.Kind, x.Value }).IsUnique().HasDatabaseName("IX_DeckMetadataExclusions_Deck_Kind_Value");
+        });
+
+        modelBuilder.Entity<MetadataEditSettings>(entity =>
+        {
+            entity.ToTable("MetadataEditSettings", "jiten");
+            entity.HasKey(x => x.Id);
+            entity.Property(x => x.Id).ValueGeneratedNever();
+        });
+
+        modelBuilder.Entity<MetadataContributor>(entity =>
+        {
+            entity.ToTable("MetadataContributors", "jiten");
+            entity.HasKey(x => x.UserId);
+            entity.Property(x => x.UserId).HasMaxLength(450);
         });
 
         modelBuilder.Entity<Franchise>(entity =>
@@ -1378,6 +1449,8 @@ public class JitenDbContext : DbContext
             entity.Property(n => n.LinkUrl).HasMaxLength(300);
             entity.Property(n => n.IsRead).HasDefaultValue(false);
             entity.Property(n => n.CreatedAt).IsRequired();
+            entity.Property(n => n.GroupKey).HasMaxLength(100);
+            entity.Property(n => n.GroupCount).HasDefaultValue(1);
 
             if (isNpgsql)
             {

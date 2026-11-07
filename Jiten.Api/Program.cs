@@ -58,6 +58,21 @@ builder.Services.AddControllers().AddJsonOptions(options =>
 {
     options.JsonSerializerOptions.NumberHandling =
         JsonNumberHandling.AllowNamedFloatingPointLiterals;
+}).ConfigureApiBehaviorOptions(options =>
+{
+    var defaultFactory = options.InvalidModelStateResponseFactory;
+    options.InvalidModelStateResponseFactory = context =>
+    {
+        var errors = context.ModelState
+                            .Where(e => e.Value?.Errors.Count > 0)
+                            .Take(5)
+                            .Select(e => $"{e.Key}: {e.Value!.Errors[0].ErrorMessage}");
+        context.HttpContext.RequestServices.GetRequiredService<ILoggerFactory>()
+               .CreateLogger("Jiten.Api.ModelValidation")
+               .LogWarning("Request rejected by model validation: {Path} {Errors}",
+                           context.HttpContext.Request.Path.Value, string.Join(" | ", errors));
+        return defaultFactory(context);
+    };
 });
 
 builder.Services.AddEndpointsApiExplorer();
@@ -131,27 +146,11 @@ builder.Services.AddHttpClient("Voicevox", client =>
 });
 builder.Services.AddSingleton<ITtsService, TtsService>();
 
-builder.Services.AddHttpClient(SyosetuSource.HttpClientName, client =>
-       {
-           client.DefaultRequestHeaders.Add("User-Agent",
-                                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                                            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-           client.Timeout = TimeSpan.FromSeconds(30);
-       })
-       // The API's gzip=5 body is inflated by hand; this covers the HTML pages
-       .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
-       {
-           AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
-       });
-
-builder.Services.AddSingleton<IWebNovelSource, SyosetuSource>();
-builder.Services.AddSingleton<IWebNovelSource>(sp => new SyosetuSource(sp.GetRequiredService<IHttpClientFactory>(),
-                                                                        sp.GetRequiredService<ILogger<SyosetuSource>>(),
-                                                                        WebNovelProvider.SyosetuNovel18));
-builder.Services.AddSingleton<IWebNovelSourceResolver, WebNovelSourceResolver>();
+builder.Services.AddWebNovelSources();
 
 builder.Services.Configure<YtDlpOptions>(builder.Configuration.GetSection("YtDlp"));
 builder.Services.Configure<YouTubeOptions>(builder.Configuration.GetSection("YouTube"));
+builder.Services.Configure<FsrsAutoOptimiseOptions>(builder.Configuration.GetSection("Fsrs:AutoOptimise"));
 builder.Services.AddHttpClient("YouTube", client =>
 {
     client.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Jiten/1.0");
@@ -199,6 +198,9 @@ bool IsTrustedIp(HttpContext ctx) => rateLimitTrustedIps.Count > 0 && rateLimitT
 
 bool IsFirstPartyBrowser(HttpContext ctx) =>
     !ctx.User.HasClaim("auth_scheme", "ApiKey") && ctx.Request.Headers.Origin.ToString() == "https://jiten.moe";
+
+builder.Services.AddSingleton(new DeckQuotaExemption(ctx => IsTrustedSsr(ctx) || IsTrustedIp(ctx)));
+builder.Services.AddScoped<DeckQuotaFilter>();
 
 // OpenTelemetry Configuration
 var otelConfig = builder.Configuration.GetSection("OpenTelemetry");
@@ -508,6 +510,7 @@ builder.Services.AddSingleton<Jiten.Api.Services.Stripe.IStripeGateway, Jiten.Ap
 builder.Services.AddScoped<Jiten.Api.Services.Stripe.StripeService>();
 builder.Services.AddSingleton<IWordFormSiblingCache, WordFormSiblingCache>();
 builder.Services.AddSingleton<IDerivationLinkCache, DerivationLinkCache>();
+builder.Services.AddSingleton<IWordSetMemberCache, WordSetMemberCache>();
 builder.Services.AddSingleton<Jiten.Api.Services.SmartDeck.IWordReferenceCache, Jiten.Api.Services.SmartDeck.WordReferenceCache>();
 builder.Services.AddScoped<Jiten.Api.Services.SmartDeck.ISmartDeckBuilder, Jiten.Api.Services.SmartDeck.SmartDeckBuilder>();
 builder.Services.AddSingleton<Jiten.Api.Services.SmartDeck.ISmartDeckDirtyService, Jiten.Api.Services.SmartDeck.SmartDeckDirtyService>();
@@ -536,12 +539,20 @@ builder.Services.AddSingleton(OneTimeNoticeRegistry.Default);
 builder.Services.AddScoped<IOneTimeNoticeService, OneTimeNoticeService>();
 builder.Services.AddScoped<IStudyDeckMembershipService, StudyDeckMembershipService>();
 builder.Services.AddScoped<DeckMetadataService>();
+builder.Services.AddScoped<Jiten.Api.Services.MetadataEdits.MetadataTrustService>();
+builder.Services.AddScoped<Jiten.Api.Services.MetadataEdits.CharacterNameCheckService>();
+builder.Services.AddScoped<Jiten.Api.Services.MetadataEdits.MetadataEditService>();
 builder.Services.AddScoped<SubdeckListSeeder>();
 builder.Services.AddScoped<FranchiseService>();
 builder.Services.AddScoped<FranchiseSuggestionService>();
 builder.Services.AddSingleton<FranchiseResponseCache>();
 builder.Services.AddScoped<FranchiseSyncRunner>();
 builder.Services.AddScoped<SeriesService>();
+builder.Services.AddScoped<IProfileAccessService, ProfileAccessService>();
+builder.Services.AddSingleton<IProfileCacheService, ProfileCacheService>();
+builder.Services.AddSingleton<ProfileGenerationInterceptor>();
+builder.Services.ConfigureDbContext<UserDbContext>((sp, options) => options.AddInterceptors(sp.GetRequiredService<ProfileGenerationInterceptor>()),
+                                                   ServiceLifetime.Singleton);
 builder.Services.AddScoped<MediaGroupService>();
 builder.Services.AddScoped<MediaTitleSearchService>();
 builder.Services.AddScoped<MediaDuplicateService>();
@@ -792,6 +803,20 @@ builder.Services.AddRateLimiter(options =>
             });
     });
 
+    options.AddPolicy("metadata-edit", context =>
+    {
+        var userId = context.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        var partitionKey = userId != null ? $"user:{userId}" : $"ip:{GetClientIp(context)}";
+
+        return RateLimitPartition.GetSlidingWindowLimiter(partitionKey,
+            _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = 40, Window = TimeSpan.FromSeconds(60), SegmentsPerWindow = 6,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst, QueueLimit = 0,
+                AutoReplenishment = true
+            });
+    });
+
     options.AddPolicy("card-media-import", context =>
     {
         var userId = context.User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
@@ -954,7 +979,7 @@ builder.Services.AddCors(options =>
             })
             .AllowAnyHeader()
             .AllowAnyMethod()
-            .WithExposedHeaders("Retry-After")
+            .WithExposedHeaders("Retry-After", Jiten.Api.Controllers.StudyController.OverviewVersionHeader)
             // Chromium caps preflight caching at 2 hours; origin or header changes take up to this long to reach cached clients.
             .SetPreflightMaxAge(TimeSpan.FromHours(2));
     });
@@ -977,6 +1002,7 @@ builder.Services.AddScoped<ReparseJob>();
 builder.Services.AddScoped<ComputationJob>();
 builder.Services.AddScoped<SrsRecomputeJob>();
 builder.Services.AddScoped<FsrsModelMigrationJob>();
+builder.Services.AddScoped<FsrsAutoOptimiseJob>();
 builder.Services.AddScoped<LapseRecountJob>();
 builder.Services.AddScoped<ReviewRollupJob>();
 builder.Services.AddScoped<DifficultyAdjustmentJob>();
@@ -1047,22 +1073,25 @@ builder.Services.AddHangfireServer((options) =>
 });
 
 
-builder.Services.AddHangfireServer((options) =>
+foreach (var site in WebNovelProviders.Sites)
 {
-    options.ServerName = "WebNovelSyosetuServer";
-    options.Queues = [WebNovelQueues.Syosetu];
-    options.WorkerCount = 1;
-    // A large novel can take hours
-    options.ShutdownTimeout = TimeSpan.FromHours(3);
-    options.StopTimeout = TimeSpan.FromHours(3);
-});
+    builder.Services.AddHangfireServer((options) =>
+    {
+        options.ServerName = $"WebNovelServer-{site.Key}";
+        options.Queues = [WebNovelQueues.For(site, WebNovelQueueKind.Fetch)];
+        options.WorkerCount = 1;
+        // A large novel can take hours
+        options.ShutdownTimeout = TimeSpan.FromHours(3);
+        options.StopTimeout = TimeSpan.FromHours(3);
+    });
 
-builder.Services.AddHangfireServer((options) =>
-{
-    options.ServerName = "WebNovelSyosetuMetadataServer";
-    options.Queues = [WebNovelQueues.SyosetuMetadata];
-    options.WorkerCount = 1;
-});
+    builder.Services.AddHangfireServer((options) =>
+    {
+        options.ServerName = $"WebNovelMetadataServer-{site.Key}";
+        options.Queues = [WebNovelQueues.For(site, WebNovelQueueKind.Metadata)];
+        options.WorkerCount = 1;
+    });
+}
 
 builder.Services.AddHangfireServer((options) =>
 {
@@ -1242,6 +1271,11 @@ if (!app.Environment.IsEnvironment("Testing"))
         "site-stats-snapshot",
         job => job.Snapshot(),
         Cron.Daily(2));
+
+    recurringJobs.AddOrUpdate<FsrsAutoOptimiseJob>(
+        "fsrs-auto-optimise",
+        job => job.Run(),
+        "0 9 * * *");
 
     recurringJobs.AddOrUpdate<SiteStatsJob>(
         "site-stats-words-for-coverage",

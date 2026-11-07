@@ -102,19 +102,35 @@ public class MediaDeckController(
         return await context.Decks.AsNoTracking().Where(d => d.ParentDeckId == null).Select(d => d.DeckId).ToListAsync();
     }
 
-    /// <summary>
-    /// Returns top-level media decks with the fields needed for sitemap entries (lastmod + cover image).
-    /// </summary>
+    /// <summary>LastUpdate ignores reparses: they touch every deck at once, which teaches Google to distrust lastmod.</summary>
     [HttpGet("get-media-decks-sitemap")]
     [ResponseCache(Duration = 60 * 60)]
     [SwaggerOperation(Summary = "Get top-level media decks for sitemap generation")]
     [ProducesResponseType(typeof(List<MediaDeckSitemapEntry>), StatusCodes.Status200OK)]
     public async Task<List<MediaDeckSitemapEntry>> GetMediaDecksForSitemap()
     {
-        return await context.Decks.AsNoTracking()
-                            .Where(d => d.ParentDeckId == null)
-                            .Select(d => new MediaDeckSitemapEntry(d.DeckId, d.LastUpdate, d.CoverName))
-                            .ToListAsync();
+        var lastEdits = await context.MetadataEdits.AsNoTracking()
+                                     .Where(e => e.AppliedAt != null)
+                                     .GroupBy(e => e.Deck!.ParentDeckId ?? e.DeckId)
+                                     .Select(g => new { DeckId = g.Key, AppliedAt = g.Max(e => e.AppliedAt!.Value) })
+                                     .ToDictionaryAsync(x => x.DeckId, x => x.AppliedAt);
+
+        var decks = await context.Decks.AsNoTracking()
+                                 .Where(d => d.ParentDeckId == null)
+                                 .Select(d => new { d.DeckId, d.CreationDate, d.CoverName })
+                                 .ToListAsync();
+
+        return decks.Select(d =>
+        {
+            var lastUpdate = d.CreationDate;
+            if (lastEdits.TryGetValue(d.DeckId, out var appliedAt))
+            {
+                var applied = new DateTimeOffset(DateTime.SpecifyKind(appliedAt, DateTimeKind.Utc));
+                if (applied > lastUpdate) lastUpdate = applied;
+            }
+
+            return new MediaDeckSitemapEntry(d.DeckId, lastUpdate, d.CoverName);
+        }).ToList();
     }
 
     /// <summary>
@@ -1513,6 +1529,7 @@ public class MediaDeckController(
     /// <param name="limit">Page size, clamped to 1-200.</param>
     /// <returns>Paginated deck vocabulary list.</returns>
     [HttpGet("{id}/vocabulary")]
+    [ServiceFilter(typeof(DeckQuotaFilter))]
     [SwaggerOperation(Summary = "Get deck vocabulary")]
     [ProducesResponseType(typeof(PaginatedResponse<DeckVocabularyListDto?>), StatusCodes.Status200OK)]
     public async Task<PaginatedResponse<DeckVocabularyListDto?>> GetVocabulary(int id, string? sortBy = "",
@@ -1794,6 +1811,7 @@ public class MediaDeckController(
         if (deck.ParentDeckId == null)
             mainDeckDto.DiscussionReplyCount = await ForumTopicStore.ReplyCountAsync(context, ForumSubject.Deck, deck.DeckId);
 
+        DeckDetailsDto? viewerDetails = null;
         if (currentUserService.IsAuthenticated)
         {
             var userId = currentUserService.UserId!;
@@ -1839,6 +1857,14 @@ public class MediaDeckController(
                 mainDeckDto.IsIgnored = mpref.IsIgnored;
             }
 
+            var detailsDeckId = deck.ParentDeckId ?? deck.DeckId;
+            var detailsPreference = detailsDeckId == deck.DeckId
+                ? mpref
+                : await userContext.UserDeckPreferences.AsNoTracking().FirstOrDefaultAsync(p => p.UserId == userId && p.DeckId == detailsDeckId);
+            if (detailsPreference != null)
+                viewerDetails = DeckDetailsDto.From(detailsDeckId, detailsPreference,
+                                                    await userContext.UserPinnedDecks.AnyAsync(p => p.UserId == userId && p.DeckId == detailsDeckId));
+
             // Stored sentence metrics exist per title only, so the visible subdecks are read exactly from their own text.
             var subdeckSentences = sentenceStats != null && subdeckDtos.Count > 0
                                    && await jitenPlusService.GetTierAsync(userId) >= JitenPlusTier.Trial
@@ -1865,7 +1891,7 @@ public class MediaDeckController(
         }
 
         var parentDeckDto = parentDeck != null ? new DeckDto(parentDeck) : null;
-        var dto = new DeckDetailDto { ParentDeck = parentDeckDto, MainDeck = mainDeckDto, SubDecks = subdeckDtos };
+        var dto = new DeckDetailDto { ParentDeck = parentDeckDto, MainDeck = mainDeckDto, SubDecks = subdeckDtos, ViewerDetails = viewerDetails };
 
         return new PaginatedResponse<DeckDetailDto?>(dto, totalCount, pageSize, offset ?? 0);
     }
@@ -1951,6 +1977,7 @@ public class MediaDeckController(
     /// <returns>File content result with the generated deck.</returns>
     [HttpPost("{id}/download")]
     [EnableRateLimiting("download")]
+    [ServiceFilter(typeof(DeckQuotaFilter))]
     [SwaggerOperation(Summary = "Download a deck",
                       Description = "Generate a deck file (Anki, CSV, TXT, Yomitan) with optional filters and ordering.")]
     [Produces("application/x-binary", "text/csv", "text/plain", "application/zip")]

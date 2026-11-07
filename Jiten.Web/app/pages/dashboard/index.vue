@@ -3,7 +3,7 @@
   import Button from 'primevue/button';
 
   useHead({
-    title: 'Dashboard - Jiten',
+    title: 'Dashboard',
   });
 
   definePageMeta({
@@ -59,7 +59,7 @@
       <Card class="shadow-md">
         <template #title>Add Webnovel</template>
         <template #content>
-          <p class="mb-4">Import a syosetu novel and keep it in sync</p>
+          <p class="mb-4">Import a Syosetu or Kakuyomu novel and keep it in sync</p>
           <div class="flex justify-center">
             <Button label="Add Webnovel" class="p-button-primary" @click="navigateTo('/dashboard/add-webnovel')" />
           </div>
@@ -124,6 +124,17 @@
           <p class="mb-4">Create, edit, and manage word sets</p>
           <div class="flex justify-center">
             <Button label="Manage Word Sets" class="p-button-primary" @click="navigateTo('/dashboard/word-sets')" />
+          </div>
+        </template>
+      </Card>
+
+      <Card class="shadow-md">
+        <template #title>Metadata Edits</template>
+        <template #content>
+          <p class="mb-4">Trust thresholds, auto-apply rules, reviewers and contributors</p>
+          <div class="flex flex-wrap justify-center gap-2">
+            <Button label="Settings" class="p-button-primary" @click="navigateTo('/dashboard/metadata-edits/settings')" />
+            <Button label="Review queue" severity="secondary" @click="navigateTo('/review')" />
           </div>
         </template>
       </Card>

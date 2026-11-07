@@ -323,8 +323,8 @@ public class MediaListEntryTests(JitenWebApplicationFactory factory)
         var csv = await (await Send(HttpMethod.Get, "/api/user/media-list/export?format=csv")).Content.ReadAsStringAsync();
         var lines = csv.TrimStart('﻿').Split('\n', StringSplitOptions.RemoveEmptyEntries);
 
-        lines[0].Trim().Should().EndWith("ExternalLinks,StartedOn,FinishedOn,TimesCompleted,CharactersRead");
-        lines[1].Trim().Should().EndWith(",,2024-05-12,1,");
+        lines[0].Trim().Should().EndWith("ExternalLinks,StartedOn,FinishedOn,TimesCompleted,CharactersRead,Score,Note,IsPrivate");
+        lines[1].Trim().Should().EndWith(",,2024-05-12,1,,,,False");
     }
 
     private async Task Age(int deckId, int days)
@@ -512,6 +512,31 @@ public class MediaListEntryTests(JitenWebApplicationFactory factory)
     }
 
     [Fact]
+    public async Task PastCompletedPass_KeepsTheUnlinkedUnitsAlreadyDoneOnTheSeriesPassInProgress()
+    {
+        var (series, volumes) = await SeedSeries(3);
+        await SetStatus(series, DeckStatus.Ongoing);
+        await SetUnits(series, 2);
+        using (var scope = factory.Services.CreateScope())
+        {
+            var userDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
+            var unitEntries = await userDb.UserMediaListEntries.Where(r => r.UserId == TestUsers.UserA && volumes.Contains(r.DeckId)).ToListAsync();
+            unitEntries.Should().HaveCount(2);
+            unitEntries.ForEach(r => r.SeriesEntryId = null);
+            await userDb.SaveChangesAsync();
+        }
+
+        var response = await Send(HttpMethod.Post, $"/api/user/media-list/entries/{series}",
+                                  new { state = MediaListEntryState.Completed, finishedOn = "2010-04-03" });
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        body.GetProperty("summary").GetProperty("completedUnits").GetInt32().Should().Be(2);
+        body.GetProperty("summary").GetProperty("completedCount").GetInt32().Should().Be(1);
+        (await SetUnits(series, 1)).GetProperty("listEntry").GetProperty("completedUnits").GetInt32().Should().Be(1);
+    }
+
+    [Fact]
     public async Task Units_LoweringRemovesBareCompletionsAndReopensOnesWithHistory()
     {
         var (series, volumes) = await SeedSeries(4);
@@ -672,7 +697,9 @@ public class MediaListEntryTests(JitenWebApplicationFactory factory)
         using var scope = factory.Services.CreateScope();
         var userDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
         await userDb.Users.Where(u => u.Id == TestUsers.UserA)
-                    .ExecuteUpdateAsync(u => u.SetProperty(x => x.NormalizedUserName, TestUsers.UserA.ToUpperInvariant()));
+                    .ExecuteUpdateAsync(u => u.SetProperty(x => x.NormalizedUserName, TestUsers.UserA.ToUpperInvariant())
+                                             .SetProperty(x => x.DisplayName, TestUsers.UserA)
+                                             .SetProperty(x => x.NormalizedDisplayName, TestUsers.UserA.ToUpperInvariant()));
         userDb.UserProfiles.Add(new UserProfile { UserId = TestUsers.UserA, IsPublic = true, IsMediaListPublic = true });
         userDb.UserAccomplishments.Add(new UserAccomplishment
                                        {
@@ -684,7 +711,7 @@ public class MediaListEntryTests(JitenWebApplicationFactory factory)
     }
 
     [Fact]
-    public async Task PublicList_KeepsEntriesAndUnfinishedCountsPrivate()
+    public async Task PublicList_KeepsEntriesPrivateButNotTotals()
     {
         var deckId = await SeedDeck("VN");
         await SetStatus(deckId, DeckStatus.Completed, new { date = "2024-05-12" });
@@ -703,26 +730,24 @@ public class MediaListEntryTests(JitenWebApplicationFactory factory)
         var listUrl = $"/api/user/profile/{TestUsers.UserA}/media-list";
         var accomplishmentsUrl = $"/api/user/profile/{TestUsers.UserA}/accomplishments";
         var unfinishedOnlyUrl = $"/api/user/user/{TestUsers.UserA}/accomplishments/{MediaType.Novel}";
+        foreach (var viewer in new[] { null, TestUsers.UserB, TestUsers.UserA })
+        {
+            var totals = (await Get(accomplishmentsUrl, viewer)).EnumerateArray().ToList();
+            totals.Should().HaveCount(2);
+            var global = totals.Single(t => t.GetProperty("mediaType").ValueKind == JsonValueKind.Null);
+            global.GetProperty("unfinishedCharacterCount").GetInt64().Should().Be(500);
+            global.GetProperty("totalCharacterCount").GetInt64().Should().Be(3000);
+            (await Get(unfinishedOnlyUrl, viewer)).GetProperty("unfinishedCharacterCount").GetInt64().Should().Be(200);
+        }
+
         foreach (var viewer in new[] { null, TestUsers.UserB })
         {
             var deck = (await Get(listUrl, viewer)).EnumerateArray().Single();
             (deck.TryGetProperty("listEntry", out var listEntry) ? listEntry.ValueKind : JsonValueKind.Null).Should().Be(JsonValueKind.Null);
-            var totals = (await Get(accomplishmentsUrl, viewer)).EnumerateArray().Single();
-            totals.GetProperty("unfinishedCharacterCount").GetInt64().Should().Be(0);
-            totals.GetProperty("totalCharacterCount").GetInt64().Should().Be(3000);
-
-            var unfinishedOnly = new HttpRequestMessage(HttpMethod.Get, unfinishedOnlyUrl);
-            if (viewer != null)
-                unfinishedOnly.WithUser(viewer);
-            (await _client.SendAsync(unfinishedOnly)).StatusCode.Should().Be(HttpStatusCode.NotFound);
         }
 
         (await Get(listUrl, TestUsers.UserA)).EnumerateArray().Single().GetProperty("listEntry").GetProperty("finishedOn").GetString()
                                             .Should().Be("2024-05-12");
-        var ownTotals = (await Get(accomplishmentsUrl, TestUsers.UserA)).EnumerateArray().ToList();
-        ownTotals.Should().HaveCount(2);
-        ownTotals.Single(t => t.GetProperty("mediaType").ValueKind == JsonValueKind.Null).GetProperty("unfinishedCharacterCount").GetInt64().Should().Be(500);
-        (await Get(unfinishedOnlyUrl, TestUsers.UserA)).GetProperty("unfinishedCharacterCount").GetInt64().Should().Be(200);
     }
 
     [Fact]
@@ -858,6 +883,51 @@ public class MediaListEntryTests(JitenWebApplicationFactory factory)
 
         (await Entries(deckId)).Should().BeEmpty();
         (await Preference(deckId))!.Status.Should().Be(DeckStatus.Dropped);
+    }
+
+    [Fact]
+    public async Task DroppingATitleNotOnTheList_RecordsADroppedPassToLogProgressOn()
+    {
+        var deckId = await SeedDeck("VN");
+
+        await SetStatus(deckId, DeckStatus.Dropped, new { date = "2024-06-01" });
+        await LogCharacters(deckId, 200);
+
+        (await Preference(deckId))!.Status.Should().Be(DeckStatus.Dropped);
+        var entry = (await Entries(deckId)).Single();
+        entry.State.Should().Be(MediaListEntryState.Dropped);
+        entry.FinishedOn.Should().Be(new DateOnly(2024, 6, 1));
+        entry.CharactersRead.Should().Be(200);
+        (await Preference(deckId))!.CurrentEntryId.Should().Be(entry.Id);
+    }
+
+    [Fact]
+    public async Task BulkDroppingTitlesNotOnTheList_RecordsNoPass()
+    {
+        var deckId = await SeedDeck("VN");
+
+        (await Send(HttpMethod.Post, "/api/user/deck-preferences/bulk", new { deckIds = new[] { deckId }, status = DeckStatus.Dropped }))
+            .StatusCode.Should().Be(HttpStatusCode.OK);
+
+        (await Entries(deckId)).Should().BeEmpty();
+        (await Preference(deckId))!.Status.Should().Be(DeckStatus.Dropped);
+    }
+
+    [Fact]
+    public async Task PastDroppedRead_OnATitleNotOnTheList_MarksItDropped()
+    {
+        var deckId = await SeedDeck("VN");
+
+        (await Send(HttpMethod.Post, $"/api/user/media-list/entries/{deckId}",
+                    new { state = MediaListEntryState.Dropped, finishedOn = "2023-03-01", charactersRead = 150 }))
+            .StatusCode.Should().Be(HttpStatusCode.OK);
+
+        var preference = (await Preference(deckId))!;
+        preference.Status.Should().Be(DeckStatus.Dropped);
+        var entry = (await Entries(deckId)).Single();
+        entry.State.Should().Be(MediaListEntryState.Dropped);
+        entry.CharactersRead.Should().Be(150);
+        preference.CurrentEntryId.Should().Be(entry.Id);
     }
 
     [Fact]

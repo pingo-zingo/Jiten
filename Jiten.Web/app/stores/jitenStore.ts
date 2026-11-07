@@ -1,6 +1,14 @@
 import { defineStore } from 'pinia';
-import { type DifficultyDisplayStyle, DifficultyValueDisplayStyle, type SentenceFuriganaMode, ThemeMode, TitleLanguage } from '~/types';
-import type { KanjiScalePref } from '~/data/kanjiGroupings';
+import {
+  type DifficultyDisplayStyle,
+  DifficultyValueDisplayStyle,
+  MediaType,
+  type ProfileChartMeasure,
+  type SentenceFuriganaMode,
+  ThemeMode,
+  TitleLanguage,
+} from '~/types';
+import type { DisplayType as KanjiGridGrouping, KanjiScalePref } from '~/data/kanjiGroupings';
 import { DEFAULT_TTS_VOLUME } from '~/utils/ttsVolume';
 import type { CoverageScale } from '~/utils/coverageAxis';
 import { DEFAULT_WORD_STATE_COLOURS, type WordStateColourKey, type WordStateColours } from '~/utils/wordState';
@@ -251,9 +259,18 @@ export const useJitenStore = defineStore('jiten', () => {
 
   const coverageJourneyScale = createLocalStorageState<CoverageScale>('coverage-journey-scale', 'fit');
 
+  const profileLadderSplitTypes = createCookieState<MediaType[]>('profile-ladder-split', [MediaType.Novel, MediaType.NonFiction]);
+  const profileLadderTrend = createCookieState<boolean>('profile-ladder-trend', false);
+  /** Keyed by stats chart; a chart without an entry counts titles, or characters for the per-month chart. */
+  const profileChartMeasures = createCookieState<Record<string, ProfileChartMeasure>>('profile-chart-measures', {});
+  const profileMonthGrouping = createCookieState<'month' | 'year'>('profile-month-grouping', 'month');
+
   const franchiseLinkMode = createLocalStorageState<FranchiseLinkMode>('franchise-link-mode', 'all');
   const franchiseCardSize = createLocalStorageState<FranchiseCardSize>('franchise-card-size', 'covers');
   const franchiseSeriesDensity = createLocalStorageState<FranchiseSeriesDensity>('franchise-series-density', 'detailed');
+
+  const kanjiGridGrouping = createLocalStorageState<KanjiGridGrouping>('kanji-grid-grouping', 'none');
+  const kanjiGridOnlyTracked = createLocalStorageState<boolean>('kanji-grid-only-tracked', false);
 
   // Drives the unread dot on the home page's "what's new" strip.
   const lastSeenUpdateId = createLocalStorageState<number>('last-seen-update-id', 0);
@@ -336,9 +353,15 @@ export const useJitenStore = defineStore('jiten', () => {
     hideSentenceStats,
     separatePriorKnowledge,
     coverageJourneyScale,
+    profileLadderSplitTypes,
+    profileLadderTrend,
+    profileChartMeasures,
+    profileMonthGrouping,
     franchiseLinkMode,
     franchiseCardSize,
     franchiseSeriesDensity,
+    kanjiGridGrouping,
+    kanjiGridOnlyTracked,
     lastSeenUpdateId,
     customDictionaryFontSize,
     coverageVersion,

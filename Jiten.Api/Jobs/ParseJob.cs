@@ -1,5 +1,6 @@
 using Jiten.Api.Services;
 using Jiten.Core;
+using Jiten.Core.Services;
 using Jiten.Core.Data;
 using Jiten.Core.Data.Providers;
 using Microsoft.EntityFrameworkCore;
@@ -137,7 +138,7 @@ public class ParseJob(
         if (metadata.Links.Any())
         {
             var firstLink = metadata.Links.First();
-            await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, firstLink.LinkType);
+            await MetadataProviderHelper.ApplyGenreAndTagMappings(context, deck, metadata, firstLink.LinkType, DeckMetadataExclusionSet.Empty);
         }
 
         // Sources with no cover art (webnovels) fall back to nocover.jpg, set above
@@ -146,7 +147,8 @@ public class ParseJob(
             : [];
 
         // Insert the deck into the database
-        await JitenHelper.InsertDeck(contextFactory, deck, coverImage, false);
+        if (!await JitenHelper.InsertDeck(contextFactory, deck, coverImage, false))
+            throw new InvalidOperationException($"Inserting deck '{deck.OriginalTitle}' failed; the database error is logged just before this one.");
 
         if (requestId is > 0)
             await LinkFulfilledRequest(requestId.Value, deck.DeckId);

@@ -1,6 +1,7 @@
 <script setup lang="ts">
   import { DisplayStyle, MediaType } from '~/types';
   import { coverUrl } from '~/utils/coverImage';
+  import { isMainEntry } from '~/utils/displayDeck';
   import { useApiFetchPaginated } from '~/composables/useApiFetch';
   import { useJitenStore } from '~/stores/jitenStore';
   import { useAuthStore } from '~/stores/authStore';
@@ -322,7 +323,8 @@
     const d = mainDeck.value;
     if (!d) return '';
     const type = getMediaTypeText(d.mediaType);
-    const orig = d.originalTitle ? ` (${d.originalTitle})` : '';
+    const original = d.originalTitle?.trim();
+    const orig = original && original.toLowerCase() !== localiseTitle(d).trim().toLowerCase() ? ` (${original})` : '';
     const chars = d.characterCount ? d.characterCount.toLocaleString() : '';
     const words = d.uniqueWordCount ? d.uniqueWordCount.toLocaleString() : '';
     const stats = chars ? ` - ${chars} chars, ${words} unique words` : '';
@@ -413,10 +415,16 @@
         @update:deck="updateMainDeck"
         @discussion="discussionSection?.jump()"
       />
+      <DeckEntryStrip
+        v-if="authStore.isAuthenticated && isMainEntry(response.data.mainDeck)"
+        :key="response.data.mainDeck.deckId"
+        :deck="response.data.mainDeck"
+        :details="response.data.viewerDetails"
+      />
 
       <DeckStudyOverview v-if="showSeoBlocks && isTopLevel" :deck="response.data.mainDeck" />
 
-      <LazyCoverageJourneyCard :deck-id="response.data.mainDeck.deckId" />
+      <LazyCoverageJourneyCard v-if="authStore.isAuthenticated" :deck-id="response.data.mainDeck.deckId" />
 
       <LazyDeckSentenceCard :deck-id="response.data.mainDeck.deckId" />
 

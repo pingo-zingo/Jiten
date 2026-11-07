@@ -1,5 +1,6 @@
-import { type Deck, type MediaListEntriesResponse, type MediaListEntrySummary, type MediaListSnapshot, DeckStatus } from '~/types';
+import { type Deck, type MediaListDeck, type MediaListEntriesResponse, type MediaListEntrySummary, type MediaListSnapshot, DeckStatus } from '~/types';
 import { useToast } from 'primevue/usetoast';
+import type { ToastServiceMethods } from 'primevue/toastservice';
 import { apiErrorMessage } from '~/utils/apiErrorMessage';
 import { getDeckStatusText } from '~/utils/deckStatusMapper';
 import { isoToday } from '~/utils/mediaListEntry';
@@ -10,6 +11,10 @@ export interface MediaListChange {
   status?: DeckStatus;
   listEntry?: MediaListEntrySummary | null;
   isFavourite?: boolean;
+  score?: number | null;
+  note?: string | null;
+  isPrivate?: boolean;
+  isPinned?: boolean;
 }
 
 export interface SetStatusOptions {
@@ -55,6 +60,13 @@ export interface UndoDetail {
 export const UNDO_TOAST_GROUP = 'media-list-undo';
 export const UNDO_VISIBLE_MS = 8000;
 
+/** Only the latest change can be undone, so a new toast replaces the one showing; without `run` it shows no Undo button. */
+export function showUndoToast(toast: ToastServiceMethods, summary: string, run?: () => Promise<unknown>) {
+  const detail: UndoDetail | undefined = run ? { run } : undefined;
+  toast.removeGroup(UNDO_TOAST_GROUP);
+  toast.add({ group: UNDO_TOAST_GROUP, severity: 'secondary', summary, detail, life: UNDO_VISIBLE_MS });
+}
+
 type Listener = (change: MediaListChange) => void;
 const listeners = new Set<Listener>();
 
@@ -70,10 +82,10 @@ export function onMediaListChange(listener: Listener) {
   onScopeDispose(() => listeners.delete(listener));
 }
 
-const CHANGE_FIELDS = ['status', 'listEntry', 'isFavourite'] as const;
+const CHANGE_FIELDS = ['status', 'listEntry', 'isFavourite', 'score', 'note', 'isPrivate', 'isPinned'] as const;
 
 /** Applies a change to a deck when it is the one that changed; an unchanged deck comes back as the same object, so lists skip the re-render. */
-export function applyMediaListChange<T extends Deck>(deck: T, change: MediaListChange): T {
+export function applyMediaListChange<T extends MediaListDeck>(deck: T, change: MediaListChange): T {
   if (deck.deckId !== change.deckId) return deck;
   const fields = CHANGE_FIELDS.filter((field) => field in change && deck[field] !== change[field]);
   if (fields.length === 0) return deck;
@@ -95,8 +107,22 @@ export function replaceDeck<T extends Deck>(list: T[], updated: T): T[] {
   return next;
 }
 
-/** The history dialog is mounted once in app.vue, so it outlives the popover, row or card that opened it. */
-export const useHistoryDialogDeck = () => useState<Deck | null>('media-list-history-deck', () => null);
+/** The entry dialog is mounted once in app.vue, so it outlives the popover, row or card that opened it. */
+export const useHistoryDialogDeck = () => useState<MediaListDeck | null>('media-list-history-deck', () => null);
+
+export type EntryDialogField = 'score' | 'note';
+
+/** The field the entry dialog focuses when it opens; cleared once it has. */
+export const useEntryDialogFocus = () => useState<EntryDialogField | null>('media-list-entry-focus', () => null);
+
+export function useEntryDialog() {
+  const deck = useHistoryDialogDeck();
+  const focus = useEntryDialogFocus();
+  return (target: MediaListDeck, field: EntryDialogField | null = null) => {
+    focus.value = field;
+    deck.value = target;
+  };
+}
 
 export function useMediaListApi() {
   const { $api } = useNuxtApp();
@@ -171,12 +197,9 @@ export function useMediaListApi() {
     });
   }
 
-  /** Only the latest change can be undone, so a new offer replaces the one showing. */
   function offerUndo(summary: string, previous: MediaListSnapshot[] | null | undefined) {
     if (!previous?.length) return;
-    const detail: UndoDetail = { run: () => restore(previous) };
-    toast.removeGroup(UNDO_TOAST_GROUP);
-    toast.add({ group: UNDO_TOAST_GROUP, severity: 'secondary', summary, detail, life: UNDO_VISIBLE_MS });
+    showUndoToast(toast, summary, () => restore(previous));
   }
 
   return { postDeckStatus, refreshSeries, publishEntries, offerUndo };

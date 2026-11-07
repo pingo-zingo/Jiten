@@ -3,8 +3,9 @@
 </script>
 
 <script setup lang="ts">
-  import { type DeckCard, MediaType } from '~/types';
+  import { type DeckCard, type MediaListDeck, MediaType } from '~/types';
   import { coverUrl } from '~/utils/coverImage';
+  import { formatScore } from '~/utils/formatScore';
   import { getMediaTypeText } from '~/utils/mediaTypeMapper';
   import Card from 'primevue/card';
   import { useAuthStore } from '~/stores/authStore';
@@ -24,7 +25,7 @@
   const localiseTitle = useLocaliseTitle();
 
   const props = defineProps<{
-    deck: DeckCard;
+    deck: DeckCard & Pick<MediaListDeck, 'score'>;
     lazyCover?: boolean;
   }>();
 
@@ -103,6 +104,7 @@
         >
           <div class="shrink-0 font-bold text-sm leading-tight mb-1 truncate" v-bind="japaneseTextAttrs(localiseTitle(deck))">{{ localiseTitle(deck) }}</div>
           <div class="text-xs mb-1">{{ getMediaTypeText(deck.mediaType) }}</div>
+          <div v-if="deck.score != null" class="text-xs mb-1 font-semibold tabular-nums">Score {{ formatScore(deck.score) }}</div>
 
           <div class="text-xs space-y-0.5 mt-auto">
             <div v-if="isAudioVisual && deck.speechDuration > 0" class="flex justify-between">
@@ -148,7 +150,7 @@
 
           <div class="mt-2 flex gap-1">
             <Tooltip content="Details">
-              <Button as="router-link" :to="`/decks/media/${deck.deckId}/detail`" icon="pi pi-eye" size="small" class="p-button-sm" />
+              <Button as="router-link" :to="`/decks/media/${deck.deckId}/detail`" :rel="subdeckLinkRel(deck)" icon="pi pi-eye" size="small" class="p-button-sm" />
             </Tooltip>
             <Tooltip v-if="isVideo" content="Watch with the transcript">
               <Button as="router-link" :to="`/decks/media/${deck.deckId}/watch`" icon="pi pi-youtube" size="small" class="p-button-sm" />

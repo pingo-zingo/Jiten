@@ -22,7 +22,9 @@ public record MediaListEntrySummary(
 /// <summary>One completion of a volume or episode, in the order the entries were created.</summary>
 public record VolumeCompletion(int DeckId, int VolumeCharacters, int? CharactersRead, long? SeriesEntryId);
 
-public record SeriesTally(IReadOnlyDictionary<long, long> PassCharacters, long StandaloneCharacters, IReadOnlyList<int> StandaloneDeckIds);
+/// <param name="PassOf">The pass each completion was read on, in the order given; null for a read of its own.</param>
+public record SeriesTally(IReadOnlyDictionary<long, long> PassCharacters, long StandaloneCharacters, IReadOnlyList<int> StandaloneDeckIds,
+                         IReadOnlyList<long?> PassOf);
 
 public static class MediaListEntryHelper
 {
@@ -93,9 +95,11 @@ public static class MediaListEntryHelper
     /// <summary>Mirrors a status change onto the current entry; call before setting Status. True when reading totals may have changed.</summary>
     /// <param name="undoCompletion">Dropping a Completed title turns its completion into a dropped pass; without it, dropping keeps the completion.</param>
     /// <param name="seriesPass">The series pass in progress the deck is a volume of; an entry created or completed now belongs to it.</param>
+    /// <param name="recordNewDrop">Dropping a title not on the list records a dropped pass, so the part that was read can be logged.</param>
     public static bool ApplyStatus(UserDbContext userContext, UserDeckPreference preference, DeckStatus status, DateOnly? date,
                                    bool newEntry,
-                                   int? deckCharacters = null, bool undoCompletion = false, UserMediaListEntry? seriesPass = null)
+                                   int? deckCharacters = null, bool undoCompletion = false, UserMediaListEntry? seriesPass = null,
+                                   bool recordNewDrop = false)
     {
         var entry = preference.CurrentEntry;
         var closedPass = StartsAfterCompletion(preference, newEntry);
@@ -149,6 +153,10 @@ public static class MediaListEntryHelper
                     return undone;
                 }
 
+                if (recordNewDrop && entry == null && preference.Status == DeckStatus.None)
+                    preference.CurrentEntry = NewEntry(userContext, preference, MediaListEntryState.Dropped, startedOn: null,
+                                                       finishedOn: date, seriesPass);
+
                 return false;
 
             case DeckStatus.Completed:
@@ -176,11 +184,12 @@ public static class MediaListEntryHelper
         }
     }
 
+    /// <summary>Keeps the row while it <see cref="UserDeckPreference.HoldsUserData"/>, so leaving the list never drops a favourite, score, note or privacy flag.</summary>
     public static void ClearStatus(UserDbContext userContext, UserDeckPreference preference)
     {
         preference.CurrentEntry = null;
         preference.CurrentEntryId = null;
-        if (preference.IsFavourite || preference.IsIgnored)
+        if (preference.HoldsUserData)
             preference.Status = DeckStatus.None;
         else
             userContext.UserDeckPreferences.Remove(preference);
@@ -431,36 +440,40 @@ public static class MediaListEntryHelper
     {
         var passCharacters = completedPassIds.Distinct().ToDictionary(id => id, _ => (long)seriesCharacters);
         var covered = new HashSet<(long Pass, int DeckId)>();
-        var unlinked = new List<VolumeCompletion>();
-        var standalone = new List<VolumeCompletion>();
+        var passOf = new long?[completions.Count];
+        var unlinked = new List<int>();
 
         static long Difference(VolumeCompletion c) => (c.CharactersRead ?? c.VolumeCharacters) - (long)c.VolumeCharacters;
 
-        foreach (var completion in completions)
+        for (var i = 0; i < completions.Count; i++)
         {
+            var completion = completions[i];
             if (completion.SeriesEntryId is { } link && passCharacters.ContainsKey(link) && covered.Add((link, completion.DeckId)))
-                passCharacters[link] += Difference(completion);
-            else if (completion.SeriesEntryId == null)
-                unlinked.Add(completion);
-            else
-                standalone.Add(completion);
-        }
-
-        foreach (var completion in unlinked)
-        {
-            var pass = completedPassIds.Select(id => (long?)id).FirstOrDefault(id => !covered.Contains((id!.Value, completion.DeckId)));
-            if (pass is { } p)
             {
-                covered.Add((p, completion.DeckId));
-                passCharacters[p] += Difference(completion);
+                passCharacters[link] += Difference(completion);
+                passOf[i] = link;
             }
-            else
-                standalone.Add(completion);
+            else if (completion.SeriesEntryId == null)
+                unlinked.Add(i);
         }
 
+        foreach (var i in unlinked)
+        {
+            var completion = completions[i];
+            var pass = completedPassIds.Select(id => (long?)id).FirstOrDefault(id => !covered.Contains((id!.Value, completion.DeckId)));
+            if (pass is not { } p)
+                continue;
+
+            covered.Add((p, completion.DeckId));
+            passCharacters[p] += Difference(completion);
+            passOf[i] = p;
+        }
+
+        var standalone = completions.Where((_, i) => passOf[i] == null).ToList();
         return new SeriesTally(passCharacters.ToDictionary(kv => kv.Key, kv => Math.Max(kv.Value, 0)),
                                standalone.Sum(c => (long)(c.CharactersRead ?? c.VolumeCharacters)),
-                               standalone.Select(c => c.DeckId).ToList());
+                               standalone.Select(c => c.DeckId).ToList(),
+                               passOf);
     }
 
     public static MediaListEntrySummary Summarise(IReadOnlyCollection<UserMediaListEntry> entries, IReadOnlySet<long> currentIds)

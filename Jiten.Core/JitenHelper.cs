@@ -3,6 +3,7 @@ using System.Text;
 using System.Threading;
 using Jiten.Core.Data;
 using Jiten.Core.Data.JMDict;
+using Jiten.Core.Data.MetadataEdits;
 using Jiten.Core.Services;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
@@ -14,6 +15,9 @@ public static class JitenHelper
 {
     // Cap concurrent PostgreSQL COPY operations to reduce server pressure/timeouts
     private static readonly SemaphoreSlim CopySemaphore = new SemaphoreSlim(6);
+
+    /// <summary>Mirrors CK_DeckTitles_Title_Length; longer provider aliases are dropped rather than failing the whole insert.</summary>
+    private const int DeckTitleMaxLength = 200;
 
     private static string? StripNul(string? value) =>
         value != null && value.Contains('\0') ? value.Replace("\0", "") : value;
@@ -27,6 +31,8 @@ public static class JitenHelper
 
         foreach (var title in deck.Titles)
             title.Title = StripNul(title.Title) ?? title.Title;
+
+        deck.Titles = deck.Titles.Where(t => t.Title.Length <= DeckTitleMaxLength).ToList();
 
         foreach (var link in deck.Links)
             link.Url = StripNul(link.Url) ?? link.Url;
@@ -42,7 +48,8 @@ public static class JitenHelper
             SanitizeDeckStrings(child);
     }
 
-    public static async Task InsertDeck(IDbContextFactory<JitenDbContext> contextFactory, Deck deck, byte[] cover, bool update = false)
+    /// <summary>Errors are logged, not thrown; returns false when the deck could not be written, in which case DeckId must not be trusted.</summary>
+    public static async Task<bool> InsertDeck(IDbContextFactory<JitenDbContext> contextFactory, Deck deck, byte[] cover, bool update = false)
     {
         var totalTimer = Stopwatch.StartNew();
         SanitizeDeckStrings(deck);
@@ -85,7 +92,7 @@ public static class JitenHelper
                 {
                     Console.WriteLine($"[{DateTime.UtcNow:O}] Deck {deck.OriginalTitle} already exists, no update flag or deck not changed, skipping.");
                     await transaction.RollbackAsync();
-                    return;
+                    return true;
                 }
 
                 Console.WriteLine($"[{DateTime.UtcNow:O}] Deck {deck.OriginalTitle} exists, updating metadata...");
@@ -113,7 +120,7 @@ public static class JitenHelper
                     childBulkData.Select(c => (c.deckId, c.sentenceProfile)).Append((existingDeck.DeckId, deck.SentenceProfile)));
 
                 Console.WriteLine($"[{DateTime.UtcNow:O}] Update completed.");
-                return;
+                return true;
             }
             else
             {
@@ -221,7 +228,7 @@ public static class JitenHelper
 
                 Console.WriteLine($"[{DateTime.UtcNow:O}] Bulk inserts for deck and children completed.");
                 Console.WriteLine($"Insert took {totalTimer.ElapsedMilliseconds} ms.");
-                return;
+                return true;
             }
         }
         catch (Exception ex)
@@ -240,7 +247,7 @@ public static class JitenHelper
             for (var inner = ex.InnerException; inner != null; inner = inner.InnerException)
                 detail += $"\n  -> {inner.GetType().Name}: {inner.Message}";
             Console.WriteLine($"[{DateTime.UtcNow:O}] Error inserting deck: {detail}");
-            return;
+            return false;
         }
     }
 
@@ -382,10 +389,7 @@ public static class JitenHelper
     private static (List<DeckWord> deckWords, List<ExampleSentence> exampleSentences) UpdateDeckMetadata(JitenDbContext context, Deck existingDeck, Deck deck)
     {
         existingDeck.LastUpdate = DateTime.UtcNow;
-        existingDeck.MediaType = deck.MediaType;
-        existingDeck.OriginalTitle = deck.OriginalTitle;
-        existingDeck.RomajiTitle = deck.RomajiTitle;
-        existingDeck.EnglishTitle = deck.EnglishTitle;
+        ApplyImportedIdentity(existingDeck, deck);
         existingDeck.CharacterCount = deck.CharacterCount;
         existingDeck.WordCount = deck.WordCount;
         existingDeck.UniqueWordCount = deck.UniqueWordCount;
@@ -403,6 +407,20 @@ public static class JitenHelper
         existingDeck.RawText = deck.RawText;
 
         return (deck.DeckWords?.ToList() ?? [], deck.ExampleSentences?.ToList() ?? []);
+    }
+
+    /// <summary>Copies the import's media type and titles, except fields a person corrected (<see cref="Deck.MetadataLocks"/>).</summary>
+    internal static void ApplyImportedIdentity(Deck existingDeck, Deck imported)
+    {
+        var locks = existingDeck.MetadataLocks;
+        if (!locks.HasFlag(MetadataField.MediaType))
+            existingDeck.MediaType = imported.MediaType;
+        if (!locks.HasFlag(MetadataField.OriginalTitle))
+            existingDeck.OriginalTitle = imported.OriginalTitle;
+        if (!locks.HasFlag(MetadataField.RomajiTitle))
+            existingDeck.RomajiTitle = imported.RomajiTitle;
+        if (!locks.HasFlag(MetadataField.EnglishTitle))
+            existingDeck.EnglishTitle = imported.EnglishTitle;
     }
 
     /// <summary>Stores the parser's sentence profiles and refreshes the top-level sample; a failure here never fails the deck write.</summary>
@@ -452,14 +470,18 @@ public static class JitenHelper
                                             .Where(d => d.ParentDeckId == existingDeck.DeckId)
                                             .ToListAsync();
 
-        var existingChildrenDict = existingChildren.ToDictionary(c => c.OriginalTitle);
+        var unmatchedByTitle = existingChildren.OrderBy(c => c.DeckOrder).ThenBy(c => c.DeckId)
+                                               .GroupBy(c => c.OriginalTitle)
+                                               .ToDictionary(g => g.Key, g => new Queue<Deck>(g));
+        var matchedIds = new HashSet<int>();
 
-        foreach (var child in children)
+        foreach (var child in children.OrderBy(c => c.DeckOrder))
         {
             var key = child.OriginalTitle;
 
-            if (existingChildrenDict.TryGetValue(key, out var existingChild))
+            if (unmatchedByTitle.TryGetValue(key, out var sameTitle) && sameTitle.TryDequeue(out var existingChild))
             {
+                matchedIds.Add(existingChild.DeckId);
                 try
                 {
                     await context.Entry(existingChild)
@@ -512,7 +534,7 @@ public static class JitenHelper
 
         // Bulk delete removed children
         var childrenToDelete = existingChildren
-                               .Where(ec => children.All(c => c.OriginalTitle != ec.OriginalTitle))
+                               .Where(ec => !matchedIds.Contains(ec.DeckId))
                                .Select(c => c.DeckId)
                                .ToList();
 

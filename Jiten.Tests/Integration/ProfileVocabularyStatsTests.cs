@@ -2,13 +2,13 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using FluentAssertions;
+using Jiten.Api.Services;
 using Jiten.Core;
 using Jiten.Core.Data;
 using Jiten.Core.Data.FSRS;
 using Jiten.Parser.Tests.Integration.Infrastructure;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using StackExchange.Redis;
 
 namespace Jiten.Parser.Tests.Integration;
 
@@ -17,36 +17,14 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
 {
     private readonly HttpClient _client = factory.CreateClient();
 
+    /// <summary>The in-memory Redis outlives the reset and FSRS cards never move the profile generation, so each test starts a new one.</summary>
     public async Task InitializeAsync()
     {
         await factory.ResetDatabaseAsync();
-
-        // The in-memory Redis outlives ResetDatabaseAsync, so a previous test's entry would answer for this seed.
-        var redis = factory.Services.GetRequiredService<IConnectionMultiplexer>().GetDatabase();
-        foreach (var userId in new[] { TestUsers.UserA, TestUsers.UserB, TestUsers.Admin })
-            await redis.KeyDeleteAsync($"jiten:profile-vocab:{userId}");
+        await factory.Services.GetRequiredService<IProfileCacheService>().BumpGenerationAsync([TestUsers.UserA, TestUsers.UserB, TestUsers.Admin]);
     }
 
     public Task DisposeAsync() => Task.CompletedTask;
-
-    private async Task ConfigureProfile(string userId, bool isPublic)
-    {
-        using var scope = factory.Services.CreateScope();
-        var userDb = scope.ServiceProvider.GetRequiredService<UserDbContext>();
-
-        var user = await userDb.Users.FirstAsync(u => u.Id == userId);
-        user.NormalizedUserName = (user.UserName ?? userId).ToUpperInvariant();
-
-        var profile = await userDb.UserProfiles.FirstOrDefaultAsync(p => p.UserId == userId);
-        if (profile == null)
-        {
-            profile = new UserProfile { UserId = userId };
-            userDb.UserProfiles.Add(profile);
-        }
-        profile.IsPublic = isPublic;
-
-        await userDb.SaveChangesAsync();
-    }
 
     /// <summary>Seeds one word per tier so word-level counts stay independent of the per-word max-state rule.</summary>
     private async Task SeedCards(string userId)
@@ -69,7 +47,9 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
         await userDb.SaveChangesAsync();
     }
 
-    private async Task SeedMasteredWordSet(string userId)
+    private Task SeedMasteredWordSet(string userId) => SeedWordSet(userId, WordSetStateType.Mastered, (900, 0), (901, 0));
+
+    private async Task SeedWordSet(string userId, WordSetStateType state, params (int WordId, short ReadingIndex)[] members)
     {
         using var scope = factory.Services.CreateScope();
         var jitenDb = scope.ServiceProvider.GetRequiredService<JitenDbContext>();
@@ -79,23 +59,84 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
         await jitenDb.WordSetMembers.ExecuteDeleteAsync();
         await jitenDb.WordSets.ExecuteDeleteAsync();
 
-        var set = new WordSet { Slug = "test-set", Name = "Test Set", WordCount = 2 };
+        var set = new WordSet { Slug = "test-set", Name = "Test Set", WordCount = members.Length };
         jitenDb.WordSets.Add(set);
         await jitenDb.SaveChangesAsync();
 
-        jitenDb.WordSetMembers.AddRange(
-            new WordSetMember { SetId = set.SetId, WordId = 900, ReadingIndex = 0, Position = 0 },
-            new WordSetMember { SetId = set.SetId, WordId = 901, ReadingIndex = 0, Position = 1 });
+        jitenDb.WordSetMembers.AddRange(members.Select((m, i) =>
+            new WordSetMember { SetId = set.SetId, WordId = m.WordId, ReadingIndex = m.ReadingIndex, Position = i }));
         await jitenDb.SaveChangesAsync();
 
-        userDb.UserWordSetStates.Add(new UserWordSetState { UserId = userId, SetId = set.SetId, State = WordSetStateType.Mastered });
+        userDb.UserWordSetStates.Add(new UserWordSetState { UserId = userId, SetId = set.SetId, State = state });
         await userDb.SaveChangesAsync();
+    }
+
+    private async Task<JsonElement> GetOwnAmounts()
+    {
+        var response = await _client.SendAsync(new HttpRequestMessage(HttpMethod.Get, "/api/user/vocabulary/known-ids/amount").WithUser(TestUsers.UserA));
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        return await response.Content.ReadFromJsonAsync<JsonElement>();
+    }
+
+    [Fact]
+    public async Task BlacklistedCardWithMasteredSetSibling_CountsAsWordSetMastered()
+    {
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
+        await SeedCards(TestUsers.UserA);
+        await AddCards(new FsrsCard(TestUsers.UserA, 700, 0, state: FsrsState.Blacklisted));
+        await SeedWordSet(TestUsers.UserA, WordSetStateType.Mastered, (700, 1));
+
+        var body = await GetOwnAmounts();
+
+        body.GetProperty("wordSetMastered").GetInt32().Should().Be(1, "a mastered form outranks a blacklisted sibling");
+        body.GetProperty("blacklisted").GetInt32().Should().Be(1, "only word 400 stays blacklisted");
+    }
+
+    [Fact]
+    public async Task UnreviewedCardWithMasteredSetSibling_CountsAsWordSetMastered()
+    {
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
+        await SeedCards(TestUsers.UserA);
+        await AddCards(new FsrsCard(TestUsers.UserA, 701, 0, state: FsrsState.New));
+        await SeedWordSet(TestUsers.UserA, WordSetStateType.Mastered, (701, 1));
+
+        var body = await GetOwnAmounts();
+
+        body.GetProperty("wordSetMastered").GetInt32().Should().Be(1);
+        body.GetProperty("young").GetInt32().Should().Be(1);
+    }
+
+    [Fact]
+    public async Task UnreviewedCardWithBlacklistedSetSibling_CountsAsWordSetBlacklisted()
+    {
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
+        await SeedCards(TestUsers.UserA);
+        await AddCards(new FsrsCard(TestUsers.UserA, 702, 0, state: FsrsState.New));
+        await SeedWordSet(TestUsers.UserA, WordSetStateType.Blacklisted, (702, 1));
+
+        var body = await GetOwnAmounts();
+
+        body.GetProperty("wordSetBlacklisted").GetInt32().Should().Be(1);
+        body.GetProperty("wordSetBlacklistedForm").GetInt32().Should().Be(1);
+    }
+
+    [Fact]
+    public async Task CardOnSameFormOutranksWordSet()
+    {
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
+        await SeedCards(TestUsers.UserA);
+        await AddCards(new FsrsCard(TestUsers.UserA, 703, 0, state: FsrsState.New));
+        await SeedWordSet(TestUsers.UserA, WordSetStateType.Mastered, (703, 0));
+
+        var body = await GetOwnAmounts();
+
+        body.GetProperty("wordSetMastered").GetInt32().Should().Be(0, "the form's own unreviewed card decides it");
     }
 
     [Fact]
     public async Task OwnProfile_ReturnsCounts_EvenWhenPrivate()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: false);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: false);
         await SeedCards(TestUsers.UserA);
 
         var request = new HttpRequestMessage(HttpMethod.Get, $"/api/user/profile/{TestUsers.UserA}/vocabulary-stats")
@@ -112,7 +153,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task Response_OmitsBlacklistedAndFormCounts()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: true);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
         await SeedCards(TestUsers.UserA);
 
         var request = new HttpRequestMessage(HttpMethod.Get, $"/api/user/profile/{TestUsers.UserA}/vocabulary-stats");
@@ -128,7 +169,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task PublicProfile_VisibleToOtherUser()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: true);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
         await SeedCards(TestUsers.UserA);
 
         var request = new HttpRequestMessage(HttpMethod.Get, $"/api/user/profile/{TestUsers.UserA}/vocabulary-stats")
@@ -143,7 +184,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task PublicProfile_VisibleAnonymously()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: true);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
         await SeedCards(TestUsers.UserA);
 
         var response = await _client.GetAsync($"/api/user/profile/{TestUsers.UserA}/vocabulary-stats");
@@ -156,7 +197,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task PrivateProfile_HiddenFromOtherUser()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: false);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: false);
         await SeedCards(TestUsers.UserA);
 
         var request = new HttpRequestMessage(HttpMethod.Get, $"/api/user/profile/{TestUsers.UserA}/vocabulary-stats")
@@ -177,7 +218,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task MasteredWordSet_ReportedSeparatelyFromKnownWords()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: true);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
         await SeedCards(TestUsers.UserA);
         await SeedMasteredWordSet(TestUsers.UserA);
 
@@ -192,7 +233,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task CountsMatchOwnVocabularyEndpoint()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: true);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
         await SeedCards(TestUsers.UserA);
         await SeedMasteredWordSet(TestUsers.UserA);
 
@@ -221,7 +262,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task WordWithBlacklistedSiblingForm_CountsAsKnown()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: true);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
         await SeedCards(TestUsers.UserA);
         var now = DateTime.UtcNow;
         await AddCards(
@@ -240,7 +281,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task WordWithAllFormsBlacklisted_StaysBlacklisted()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: true);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
         await SeedCards(TestUsers.UserA);
         await AddCards(new FsrsCard(TestUsers.UserA, 400, 1, state: FsrsState.Blacklisted));
 
@@ -259,7 +300,7 @@ public class ProfileVocabularyStatsTests(JitenWebApplicationFactory factory)
     [Fact]
     public async Task ResetCard_DoesNotCountAsKnown()
     {
-        await ConfigureProfile(TestUsers.UserA, isPublic: true);
+        await factory.ConfigureProfileAsync(TestUsers.UserA, isPublic: true);
         await SeedCards(TestUsers.UserA);
         var now = DateTime.UtcNow;
         // Reviewed but holding no active schedule: back in the new queue, so it counts as neither young nor mature.

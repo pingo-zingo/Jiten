@@ -1,4 +1,5 @@
 ﻿using System.Text.Json;
+using System.Collections.Frozen;
 using Jiten.Api.Dtos;
 using Jiten.Api.Helpers;
 using Jiten.Core;
@@ -29,7 +30,8 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
             excludeMatureMasteredBlacklisted, excludeAllTrackedWords,
             targetPercentage, minOccurrences, maxOccurrences, posFilter, startFromKnown, bandSource, orderSource) = request;
 
-        var deckWordsQuery = QuerySource(source);
+        var unfilteredQuery = QuerySource(source);
+        var deckWordsQuery = unfilteredQuery;
 
         if (!string.IsNullOrEmpty(posFilter))
         {
@@ -73,7 +75,8 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
                 if (targetPercentage is null or < 1 or > 100)
                     return (null, Results.BadRequest("Target percentage must be between 1 and 100"));
 
-                var coverageRows = await deckWordsQuery.ToListAsync();
+                var coverageRows = await unfilteredQuery.ToListAsync();
+                var eligibleWordIds = await LoadPosEligibleWordIds(unfilteredQuery, posFilter);
                 var coverageRanks = await LoadTieBreakRanks(coverageRows.Select(dw => dw.WordId));
 
                 var allDeckWordsForCoverage = coverageRows
@@ -99,7 +102,7 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
                 double targetCoverage = targetPercentage.Value;
 
                 var resultWords = CollectCoverageWords(
-                    allDeckWordsForCoverage, knownKeysSet, totalOccurrences, targetCoverage, startFromKnown);
+                    allDeckWordsForCoverage, knownKeysSet, totalOccurrences, targetCoverage, startFromKnown, eligibleWordIds);
 
                 if (order == DeckOrder.Chronological)
                 {
@@ -360,12 +363,15 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
         return query;
     }
 
+    private Task<DateTime?> GetListStamp(long listId)
+        => userContext.UserFrequencyLists.AsNoTracking()
+                      .Where(f => f.Id == listId)
+                      .Select(f => f.BlobGeneratedAt)
+                      .FirstOrDefaultAsync();
+
     private async Task<IReadOnlyList<(int WordId, byte ReadingIndex)>> LoadRankedListWords(long listId)
     {
-        var blobGeneratedAt = await userContext.UserFrequencyLists.AsNoTracking()
-                                               .Where(f => f.Id == listId)
-                                               .Select(f => f.BlobGeneratedAt)
-                                               .FirstOrDefaultAsync();
+        var blobGeneratedAt = await GetListStamp(listId);
         if (blobGeneratedAt is null) return [];
 
         var cacheKey = $"freqlistwords:{listId}:{blobGeneratedAt.Value.Ticks}";
@@ -386,10 +392,7 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
     /// lookups happen per page view, where scanning tens of thousands of entries would dominate the request.</summary>
     public async Task<IReadOnlyDictionary<long, int>> GetListRankMap(long listId)
     {
-        var blobGeneratedAt = await userContext.UserFrequencyLists.AsNoTracking()
-                                               .Where(f => f.Id == listId)
-                                               .Select(f => f.BlobGeneratedAt)
-                                               .FirstOrDefaultAsync();
+        var blobGeneratedAt = await GetListStamp(listId);
         if (blobGeneratedAt is null) return EmptyRankMap;
 
         var cacheKey = $"freqlistranks:{listId}:{blobGeneratedAt.Value.Ticks}";
@@ -765,6 +768,93 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
         return (await query.CountAsync(), false);
     }
 
+    /// <summary>Depends only on the subscription mix, not the user, so every holder of the same sets shares one result.</summary>
+    public async Task<(int Mastered, int Blacklisted)> CountGlobalDynamicSetForms(int? minFreq, int? maxFreq, string? posFilter,
+        bool excludeKana, FrequencyScope scope, UserWordSets wordSets)
+    {
+        if (wordSets.IsEmpty) return (0, 0);
+
+        if (scope.FrequencyListId.HasValue)
+        {
+            var entries = await ResolveListWords(scope.FrequencyListId.Value, minFreq, maxFreq, posFilter, excludeKana);
+            int listMastered = 0, listBlacklisted = 0;
+            foreach (var key in FrequencyListBlobPacker.ToKeySet(entries))
+            {
+                if (!wordSets.TryGetState(key, out var state)) continue;
+                if (state == WordSetStateType.Mastered) listMastered++;
+                else listBlacklisted++;
+            }
+
+            return (listMastered, listBlacklisted);
+        }
+
+        var cacheKey = $"gd-setforms:{wordSets.CacheKey}:{minFreq}:{maxFreq}:{posFilter}:{excludeKana}:{scope.MediaType}";
+        if (memoryCache.TryGetValue(cacheKey, out (int Mastered, int Blacklisted) cached))
+            return cached;
+
+        var allSetIds = wordSets.Sets.Select(s => s.SetId).ToList();
+        var masteredSetIds = wordSets.Sets.Where(s => s.State == WordSetStateType.Mastered).Select(s => s.SetId).ToList();
+
+        var query = BuildGlobalFrequencyQuery(minFreq, maxFreq, posFilter, scope.MediaType);
+        if (excludeKana)
+            query = query.Where(wff => context.WordForms
+                .Any(wf => wf.WordId == wff.WordId && wf.ReadingIndex == wff.ReadingIndex && wf.FormType != JmDictFormType.KanaForm));
+
+        Task<int> CountInSets(List<int> setIds)
+            => query.CountAsync(wff => context.WordSetMembers.Any(m => setIds.Contains(m.SetId) &&
+                                                                        m.WordId == wff.WordId &&
+                                                                        m.ReadingIndex == wff.ReadingIndex));
+
+        var inAnySet = await CountInSets(allSetIds);
+        var mastered = masteredSetIds.Count == 0 ? 0
+            : masteredSetIds.Count == allSetIds.Count ? inAnySet
+            : await CountInSets(masteredSetIds);
+        var blacklisted = inAnySet - mastered;
+
+        memoryCache.Set(cacheKey, (mastered, blacklisted), TimeSpan.FromHours(1));
+        return (mastered, blacklisted);
+    }
+
+    /// <summary>Must apply the same rank, kana and POS tests the study-deck stats apply per card, or the shadow subtraction drifts.</summary>
+    public async Task<IReadOnlyDictionary<VocabularyTier, int>> CountGlobalDynamicTiers(int? minFreq, int? maxFreq, string? posFilter,
+        bool excludeKana, FrequencyScope scope, RedundantTiers redundantTiers)
+    {
+        var tiers = redundantTiers.SetDriven;
+        if (tiers.Count == 0) return FrozenDictionary<VocabularyTier, int>.Empty;
+
+        DateTime? listStamp = null;
+        if (scope.FrequencyListId.HasValue)
+        {
+            listStamp = await GetListStamp(scope.FrequencyListId.Value);
+            if (listStamp == null) return FrozenDictionary<VocabularyTier, int>.Empty;
+        }
+
+        var cacheKey = $"gd-tiers:{redundantTiers.SetDrivenCacheKey}:{minFreq}:{maxFreq}:{posFilter}:{excludeKana}:{scope.MediaType}:" +
+                       $"{scope.FrequencyListId}:{listStamp?.Ticks}";
+        if (memoryCache.TryGetValue(cacheKey, out IReadOnlyDictionary<VocabularyTier, int>? cached) && cached != null)
+            return cached;
+
+        var wordIds = tiers.Keys.Select(k => WordFormHelper.DecodeWordKey(k).WordId).Distinct().ToList();
+        var ranks = await GetFrequencyRanks(wordIds, scope);
+        var kanaKeys = excludeKana ? await WordFormHelper.GetKanaFormKeys(context, wordIds) : null;
+        var posWordIds = await WordFormHelper.GetPosMatchedWordIds(context, posFilter, wordIds);
+
+        var counts = new Dictionary<VocabularyTier, int>();
+        foreach (var (key, tier) in tiers)
+        {
+            var (wordId, readingIndex) = WordFormHelper.DecodeWordKey(key);
+            if (!ranks.TryGetValue((wordId, readingIndex), out var rank)) continue;
+            if (minFreq.HasValue && rank < minFreq.Value) continue;
+            if (maxFreq.HasValue && rank > maxFreq.Value) continue;
+            if (kanaKeys != null && kanaKeys.Contains(key)) continue;
+            if (posWordIds != null && !posWordIds.Contains(wordId)) continue;
+            counts[tier] = counts.GetValueOrDefault(tier) + 1;
+        }
+
+        memoryCache.Set(cacheKey, (IReadOnlyDictionary<VocabularyTier, int>)counts, TimeSpan.FromHours(1));
+        return counts;
+    }
+
      public async Task<(int Count, HashSet<long> WordKeys)> CountDeckWords(DeckWordResolveRequest request, bool excludeKana,
                                                                           HashSet<long>? globalFrequencyKeys = null)
     {
@@ -862,17 +952,7 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
             return (0, []);
 
         var deckWordsQuery = QuerySource(source);
-
-        if (!string.IsNullOrEmpty(posFilter))
-        {
-            var posTags = JsonSerializer.Deserialize<string[]>(posFilter);
-            if (posTags is { Length: > 0 })
-            {
-                var wordIdsWithPos = context.JMDictWords.AsNoTracking()
-                    .Where(w => w.PartsOfSpeech.Any(p => posTags.Contains(p)));
-                deckWordsQuery = deckWordsQuery.Where(dw => wordIdsWithPos.Any(w => w.WordId == dw.WordId));
-            }
-        }
+        var eligibleWordIds = await LoadPosEligibleWordIds(deckWordsQuery, posFilter);
 
         var allDeckWordsUnordered = await deckWordsQuery
             .Select(dw => new { dw.WordId, dw.ReadingIndex, dw.Occurrences })
@@ -904,7 +984,8 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
                 .ToHashSet();
         }
 
-        var resultKeys = CollectCoverageKeys(keysWithOccurrences, knownKeysSet, totalOccurrences, targetPercentage, startFromKnown);
+        var resultKeys = CollectCoverageKeys(keysWithOccurrences, knownKeysSet, totalOccurrences, targetPercentage, startFromKnown,
+                                             eligibleWordIds);
 
         if (excludeKana)
         {
@@ -963,7 +1044,7 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
             cardQuery = cardQuery.Where(c =>
                 c.State == FsrsState.Mastered ||
                 c.State == FsrsState.Blacklisted ||
-                (c.LastReview != null && c.Due >= c.LastReview.Value.AddDays(21)));
+                (c.State != FsrsState.New && c.LastReview != null && c.Due >= c.LastReview.Value.AddDays(KnownWordRules.MatureIntervalDays)));
         }
 
         var cards = await cardQuery
@@ -1019,13 +1100,14 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
 
     private static List<DeckWord> CollectCoverageWords(
         List<DeckWord> allWords, HashSet<long> knownKeysSet,
-        int totalOccurrences, double targetPercentage, bool startFromKnown)
+        int totalOccurrences, double targetPercentage, bool startFromKnown, HashSet<int>? eligibleWordIds)
     {
         var keysWithOccurrences = allWords
             .Select(dw => (Key: WordFormHelper.EncodeWordKey(dw.WordId, dw.ReadingIndex), dw.Occurrences))
             .ToList();
 
-        var selectedKeys = CollectCoverageKeys(keysWithOccurrences, knownKeysSet, totalOccurrences, (float)targetPercentage, startFromKnown);
+        var selectedKeys = CollectCoverageKeys(keysWithOccurrences, knownKeysSet, totalOccurrences, (float)targetPercentage, startFromKnown,
+                                               eligibleWordIds);
 
         var result = new List<DeckWord>(selectedKeys.Count);
         for (int i = 0; i < allWords.Count && result.Count < selectedKeys.Count; i++)
@@ -1037,30 +1119,35 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
         return result;
     }
 
+    /// <summary>Coverage is measured against the whole deck; <paramref name="eligibleWordIds"/> (null = all) only limits which words may be picked.</summary>
     private static HashSet<long> CollectCoverageKeys(
         List<(long Key, int Occurrences)> items, HashSet<long>? knownKeysSet,
-        int totalOccurrences, float targetPercentage, bool startFromKnown)
+        int totalOccurrences, float targetPercentage, bool startFromKnown, HashSet<int>? eligibleWordIds = null)
     {
         var result = new HashSet<long>();
+        bool IsEligible(long key) => eligibleWordIds == null || eligibleWordIds.Contains((int)(key >> 8));
+        bool Reached(int cumulative) => (double)cumulative / totalOccurrences * 100 >= targetPercentage;
 
         if (startFromKnown && knownKeysSet != null)
         {
-            int knownOccurrences = 0;
+            int cumulative = 0;
             foreach (var (key, occ) in items)
             {
                 if (knownKeysSet.Contains(key))
-                    knownOccurrences += occ;
+                    cumulative += occ;
             }
 
-            int cumulative = knownOccurrences;
+            if (Reached(cumulative))
+                return result;
+
             foreach (var (key, occ) in items)
             {
-                if (knownKeysSet.Contains(key))
+                if (knownKeysSet.Contains(key) || !IsEligible(key))
                     continue;
 
                 result.Add(key);
                 cumulative += occ;
-                if ((double)cumulative / totalOccurrences * 100 >= targetPercentage)
+                if (Reached(cumulative))
                     break;
             }
         }
@@ -1070,13 +1157,33 @@ public class DeckWordResolver(JitenDbContext context, UserDbContext userContext,
             foreach (var (key, occ) in items)
             {
                 cumulative += occ;
-                if (knownKeysSet == null || !knownKeysSet.Contains(key))
+                if ((knownKeysSet == null || !knownKeysSet.Contains(key)) && IsEligible(key))
                     result.Add(key);
-                if ((double)cumulative / totalOccurrences * 100 >= targetPercentage)
+                if (Reached(cumulative))
                     break;
             }
         }
 
         return result;
+    }
+
+    /// <summary>Null when the filter selects no tags.</summary>
+    private async Task<HashSet<int>?> LoadPosEligibleWordIds(IQueryable<DeckWord> deckWordsQuery, string? posFilter)
+    {
+        if (string.IsNullOrEmpty(posFilter))
+            return null;
+
+        var posTags = JsonSerializer.Deserialize<string[]>(posFilter);
+        if (posTags is not { Length: > 0 })
+            return null;
+
+        var wordIdsWithPos = context.JMDictWords.AsNoTracking()
+            .Where(w => w.PartsOfSpeech.Any(p => posTags.Contains(p)));
+        var ids = await deckWordsQuery
+            .Where(dw => wordIdsWithPos.Any(w => w.WordId == dw.WordId))
+            .Select(dw => dw.WordId)
+            .Distinct()
+            .ToListAsync();
+        return ids.ToHashSet();
     }
 }

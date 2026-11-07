@@ -52,10 +52,11 @@ export function restartQuestion(status: DeckStatus | undefined, entry: MediaList
   return null;
 }
 
-/** What dropping asks first: whether a Completed title was really finished, or when a pass under way stopped; anything else records no pass. */
+/** What dropping asks first: whether a Completed title was really finished, or when a pass under way, or one on a title not yet listed, stopped; Planning records no pass. */
 export function dropQuestion(status: DeckStatus | undefined, entry: MediaListEntrySummary | null | undefined): 'unfinish' | 'stopped' | null {
   if (status === DeckStatus.Completed && entry?.state === MediaListEntryState.Completed) return 'unfinish';
-  return entry?.state === MediaListEntryState.InProgress ? 'stopped' : null;
+  if (entry?.state === MediaListEntryState.InProgress) return 'stopped';
+  return (status ?? DeckStatus.None) === DeckStatus.None && !entry ? 'stopped' : null;
 }
 
 /** The day in the viewer's calendar; the server stores dates as the user sees them. */
@@ -166,21 +167,26 @@ export function formatCharacters(count: number): string {
   return count < 10_000 ? count.toLocaleString() : compact.format(count);
 }
 
+/** A closed pass without a date gets no fact unless `undated` asks for one. */
+export function entryDateFact(
+  entry: Pick<MediaListEntrySummary, 'state' | 'startedOn' | 'finishedOn'>,
+  { droppedVerb = 'Dropped', undated = false } = {}
+): string | null {
+  if (entry.state === MediaListEntryState.InProgress) return entry.startedOn ? `Started ${formatReadDate(entry.startedOn)}` : null;
+  if (entry.state == null) return entry.finishedOn ? `Last finished ${formatReadDate(entry.finishedOn)}` : null;
+  const verb = entry.state === MediaListEntryState.Dropped ? droppedVerb : 'Finished';
+  if (entry.finishedOn) return `${verb} ${formatReadDate(entry.finishedOn)}`;
+  return undated ? `${verb}, date unknown` : null;
+}
+
 /** Short facts about a media list entry for the card and the list, most important first. */
 export function listEntryFacts(entry: MediaListEntrySummary, mediaType: MediaType, deckCharacters: number, { showUnknownDate = true } = {}): string[] {
   const facts: string[] = [];
   const words = mediaWords(mediaType);
 
-  if (entry.state === MediaListEntryState.InProgress) {
-    if (entry.startedOn) facts.push(`Started ${formatReadDate(entry.startedOn)}`);
-  } else if (entry.state === MediaListEntryState.Completed) {
-    if (entry.finishedOn) facts.push(`Finished ${formatReadDate(entry.finishedOn)}`);
-    else if (showUnknownDate) facts.push('Finish date unknown');
-  } else if (entry.state === MediaListEntryState.Dropped && entry.finishedOn) {
-    facts.push(`Dropped ${formatReadDate(entry.finishedOn)}`);
-  } else if (entry.state == null && entry.finishedOn) {
-    facts.push(`Last finished ${formatReadDate(entry.finishedOn)}`);
-  }
+  const dateFact = entryDateFact(entry);
+  if (dateFact) facts.push(dateFact);
+  else if (entry.state === MediaListEntryState.Completed && showUnknownDate) facts.push('Finish date unknown');
 
   if (entry.completedCount >= 2) facts.push(`${words.past} ${entry.completedCount} times`);
 

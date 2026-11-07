@@ -33,6 +33,7 @@ public class UserDbContext : IdentityDbContext<User>
     public DbSet<UserMediaListEntry> UserMediaListEntries { get; set; }
     public DbSet<DeckDownload> DeckDownloads { get; set; }
     public DbSet<UserFsrsSettings> UserFsrsSettings { get; set; }
+    public DbSet<FsrsParameterHistory> FsrsParameterHistories { get; set; }
 
     public DbSet<FsrsCard> FsrsCards { get; set; }
     public DbSet<FsrsReviewLog> FsrsReviewLogs { get; set; }
@@ -41,6 +42,8 @@ public class UserDbContext : IdentityDbContext<User>
 
     public DbSet<UserAccomplishment> UserAccomplishments { get; set; }
     public DbSet<UserProfile> UserProfiles { get; set; }
+    public DbSet<UserPinnedDeck> UserPinnedDecks { get; set; }
+    public DbSet<UserFavouriteWord> UserFavouriteWords { get; set; }
     public DbSet<UserKanjiGrid> UserKanjiGrids { get; set; }
 
     public DbSet<UserWordSetState> UserWordSetStates { get; set; }
@@ -190,6 +193,7 @@ public class UserDbContext : IdentityDbContext<User>
                 entity.Property(us => us.DisplayProfilesJson).HasColumnType("jsonb").HasDefaultValue("{}");
                 entity.Property(us => us.DismissedNoticesJson).HasColumnType("jsonb").HasDefaultValue("[]");
                 entity.Property(us => us.GrantedNoticesJson).HasColumnType("jsonb").HasDefaultValue("[]");
+                entity.Property(us => us.MutedNotificationGroupsJson).HasColumnType("jsonb").HasDefaultValue("[]");
             }
             else
             {
@@ -198,6 +202,7 @@ public class UserDbContext : IdentityDbContext<User>
                 entity.Property(us => us.DisplayProfilesJson).HasDefaultValue("{}");
                 entity.Property(us => us.DismissedNoticesJson).HasDefaultValue("[]");
                 entity.Property(us => us.GrantedNoticesJson).HasDefaultValue("[]");
+                entity.Property(us => us.MutedNotificationGroupsJson).HasDefaultValue("[]");
             }
 
             entity.HasOne<User>()
@@ -240,6 +245,8 @@ public class UserDbContext : IdentityDbContext<User>
             entity.Property(udp => udp.IsFavourite).IsRequired();
             entity.Property(udp => udp.IsIgnored).IsRequired();
             entity.Property(udp => udp.UpdatedAt).IsRequired();
+            entity.Property(udp => udp.Note).HasMaxLength(UserDeckPreference.MaxNoteLength);
+            entity.Property(udp => udp.IsPrivate).HasDefaultValue(false);
 
             entity.HasOne<User>()
                   .WithMany()
@@ -371,6 +378,30 @@ public class UserDbContext : IdentityDbContext<User>
                   .HasDatabaseName("IX_UserAccomplishment_UserId_MediaType");
         });
 
+        modelBuilder.Entity<UserPinnedDeck>(entity =>
+        {
+            entity.HasKey(p => new { p.UserId, p.DeckId });
+            if (isNpgsql)
+                entity.Property(p => p.UserId).HasConversion(guidToString).HasColumnType("uuid").IsRequired();
+
+            entity.HasOne<User>()
+                  .WithMany()
+                  .HasForeignKey(p => p.UserId)
+                  .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<UserFavouriteWord>(entity =>
+        {
+            entity.HasKey(w => new { w.UserId, w.WordId, w.ReadingIndex });
+            if (isNpgsql)
+                entity.Property(w => w.UserId).HasConversion(guidToString).HasColumnType("uuid").IsRequired();
+
+            entity.HasOne<User>()
+                  .WithMany()
+                  .HasForeignKey(w => w.UserId)
+                  .OnDelete(DeleteBehavior.Cascade);
+        });
+
         modelBuilder.Entity<UserProfile>(entity =>
         {
             entity.HasKey(up => up.UserId);
@@ -378,6 +409,18 @@ public class UserDbContext : IdentityDbContext<User>
                 entity.Property(up => up.UserId).HasConversion(guidToString).HasColumnType("uuid").IsRequired();
             entity.Property(up => up.IsPublic).HasDefaultValue(false);
             entity.Property(up => up.IsMediaListPublic).HasDefaultValue(false);
+            entity.Property(up => up.Bio).HasMaxLength(UserProfile.MaxBioLength);
+            entity.Property(up => up.AvatarKanji).HasMaxLength(2);
+            entity.Property(up => up.AvatarColour).HasMaxLength(16);
+            entity.Property(up => up.AvatarStyle).HasMaxLength(16);
+            entity.Property(up => up.HeaderColour).HasMaxLength(16);
+            entity.Property(up => up.LinksJson).HasDefaultValue("[]");
+            entity.Property(up => up.PrivacyJson).HasDefaultValue("{}");
+            if (isNpgsql)
+            {
+                entity.Property(up => up.LinksJson).HasColumnType("jsonb");
+                entity.Property(up => up.PrivacyJson).HasColumnType("jsonb");
+            }
 
             entity.HasOne<User>()
                   .WithOne()
@@ -433,6 +476,26 @@ public class UserDbContext : IdentityDbContext<User>
             entity.HasOne<User>()
                   .WithOne()
                   .HasForeignKey<UserFsrsSettings>(ufs => ufs.UserId)
+                  .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        modelBuilder.Entity<FsrsParameterHistory>(entity =>
+        {
+            entity.HasKey(h => h.Id);
+            if (isNpgsql)
+            {
+                entity.Property(h => h.UserId).HasConversion(guidToString).HasColumnType("uuid").IsRequired();
+                entity.Property(h => h.ParametersJson).HasColumnType("jsonb").IsRequired();
+            }
+            else
+            {
+                entity.Property(h => h.ParametersJson).IsRequired();
+            }
+            entity.HasIndex(h => new { h.UserId, h.CreatedAtUtc });
+
+            entity.HasOne<User>()
+                  .WithMany()
+                  .HasForeignKey(h => h.UserId)
                   .OnDelete(DeleteBehavior.Cascade);
         });
 
