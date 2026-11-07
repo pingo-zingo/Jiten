@@ -120,7 +120,8 @@ public static partial class Parser
         OfflineTrace("02 After PreprocessSentences", sentences);
         MergeConfirmedNameSplits([sentences]);
         PropagatePersonNameContexts(sentences);
-        OfflineTrace("03 After MergeConfirmedNameSplits + PropagatePersonNameContexts", sentences);
+        PinBareIchidanStemsBeforeAuxiliaryVerbs(sentences, diagnostics);
+        OfflineTrace("03 After MergeConfirmedNameSplits + PropagatePersonNameContexts + auxiliary-verb stem pinning", sentences);
         var wordInfos = ExtractWordInfos(sentences);
         OfflineTrace("04 Extracted WordInfo tokens", wordInfos);
         var processedWithMargins = await ProcessWordsInBatches(wordInfos, Deconjugator.Instance, diagnostics: diagnostics);
@@ -178,6 +179,69 @@ public static partial class Parser
     }
 
 
+    // Sudachi can emit a bare ichidan stem as a standalone Verb immediately before an
+    // auxiliary verb marked PossibleDependant (e.g. 付け|始めた). In this construction,
+    // use Jiten's existing VerbStemLookup to pin the stem to its attested surface+る entry.
+    // Keep Sudachi's original POS, DictionaryForm and Reading; do not route it through the
+    // noun-versus-verb arbitration, which lacks the following auxiliary's context.
+    private static void PinBareIchidanStemsBeforeAuxiliaryVerbs(
+        List<SentenceInfo> sentences, ParserDiagnostics? diagnostics)
+    {
+        static bool IsBareIchidanVerbStem(WordInfo word) =>
+            word.PartOfSpeech == PartOfSpeech.Verb
+            && word.Text.Length > 0
+            && word.Text.Any(JapaneseTextHelper.IsKanji)
+            && string.Equals(word.DictionaryForm, word.Text + "る", StringComparison.Ordinal);
+
+        bool HasAuxiliaryVerbEntry(string dictionaryForm)
+        {
+            if (string.IsNullOrWhiteSpace(dictionaryForm)
+                || !_lookups.TryGetValue(dictionaryForm, out var ids)
+                || ids == null || ids.Count == 0)
+                return false;
+
+            WordMeta.PrefetchWordMetadata(ids);
+            return ids.Any(id => WordMeta.TryGetValue(id, out var meta)
+                                 && meta.Pos.Contains(PartOfSpeech.Auxiliary));
+        }
+
+        foreach (var sentence in sentences)
+        {
+            var words = sentence.Words;
+            for (int i = 0; i + 1 < words.Count; i++)
+            {
+                var (stem, position, length) = words[i];
+                var (following, followingPosition, _) = words[i + 1];
+
+                if (!IsBareIchidanVerbStem(stem)
+                    || stem.PreMatchedWordId.HasValue
+                    || stem.PreMatchedCandidateWordIds != null
+                    || string.IsNullOrWhiteSpace(stem.Reading)
+                    || position < 0 || length <= 0 || position + length != followingPosition
+                    || following.PartOfSpeech != PartOfSpeech.Verb
+                    || !(following.HasPartOfSpeechSection(PartOfSpeechSection.PossibleDependant)
+                         || following.HasPartOfSpeechSection(PartOfSpeechSection.AuxiliaryVerbStem))
+                    || !HasAuxiliaryVerbEntry(following.DictionaryForm))
+                    continue;
+
+                // Find() verifies both the surface+る dictionary entry and its reading (ツケ → つける).
+                // Pin() is the same helper used by Jiten's online compound-verb preprocessing.
+                var verb = VerbStemLookup.Find(stem.Text, stem.Reading, _lookups, WordMeta, _wordFrequencyRanks);
+                if (verb is not { } match
+                    || !string.Equals(match.DictionaryForm, stem.Text + "る", StringComparison.Ordinal))
+                    continue;
+
+                VerbStemLookup.Pin(stem, match);
+                diagnostics?.LogParserEvent(
+                    "PinBareIchidanStemsBeforeAuxiliaryVerbs", "pin",
+                    [stem.Text, following.Text], [stem.Text],
+                    $"attested ichidan stem before auxiliary verb {following.DictionaryForm} " +
+                    $"(DictionaryForm={match.DictionaryForm}, WordId={match.WordId})");
+            }
+        }
+    }
+
+
 // GSM_JITEN_OFFLINE_PIPELINE_TRACE_V1
 
     private static void OfflineTrace(string stage, object? value)
@@ -232,8 +296,9 @@ public static partial class Parser
 
         var wanted = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "Text", "OriginalText", "DictionaryForm", "NormalizedForm", "Reading", "PartOfSpeech", "Pos",
-            "WordId", "ReadingIndex", "Start", "End", "Surface", "Word", "Margin", "Score", "Reason",
+            "Text", "OriginalText", "DictionaryForm", "NormalizedForm", "Reading", "SuffixReading", "PartOfSpeech", "Pos",
+            "PartOfSpeechSection1", "PartOfSpeechSection2", "PartOfSpeechSection3",
+            "WordId", "ReadingIndex", "PreMatchedWordId", "PreMatchedCandidateWordIds", "PreMatchedConjugations", "Start", "End", "Surface", "Word", "Margin", "Score", "Reason",
             "IsMisparse", "IsName", "Conjugations", "Key", "Value", "word", "margin", "candidates",
             "Words", "Tokens", "IsKana", "OriginalReading", "Form", "NormalizedText"
         };
@@ -908,6 +973,10 @@ CREATE TABLE IF NOT EXISTS word_index (word_id INTEGER PRIMARY KEY, frequency_ra
         private readonly BoundedLruCache<int, OfflineIndexRow> _metadataCache;
         private int? _lookupKeyCount;
 
+        // OFFLINE_FREQUENCY_RANK_COMPAT_V1: this sentinel is storage-only; no-frequency entries are absent
+        // from Jiten's IReadOnlyDictionary frequency-rank view.
+        private const int UnknownOfflineFrequencyRank = int.MaxValue - 1;
+
         private readonly record struct OfflineIndexRow(
             int FrequencyRank, bool IsNameOnly, bool IsExpression, bool IsKanjiBacked,
             Data.JmDictWordMeta Meta);
@@ -1054,22 +1123,31 @@ CREATE TABLE IF NOT EXISTS word_index (word_id INTEGER PRIMARY KEY, frequency_ra
             return connection;
         }
 
-        // Frequency-rank view. Dictionary enumeration is intentionally lazy and is not used by the parser hot path.
+        // Frequency-rank view. Entries without a real rank are not dictionary keys.
+        private bool TryGetKnownFrequencyRank(int wordId, out int rank)
+        {
+            if (TryGetIndexRow(wordId, out var row) && row.FrequencyRank != UnknownOfflineFrequencyRank)
+            {
+                rank = row.FrequencyRank;
+                return true;
+            }
+
+            rank = default;
+            return false;
+        }
+
         int IReadOnlyCollection<KeyValuePair<int, int>>.Count => GetWordIndexCount();
         IEnumerable<int> IReadOnlyDictionary<int, int>.Keys => EnumerateWordIds();
         IEnumerable<int> IReadOnlyDictionary<int, int>.Values => EnumerateWordIds().Select(id => ((IReadOnlyDictionary<int, int>)this)[id]);
-        int IReadOnlyDictionary<int, int>.this[int key] => TryGetIndexRow(key, out var row) ? row.FrequencyRank : throw new KeyNotFoundException();
-        bool IReadOnlyDictionary<int, int>.ContainsKey(int key) => TryGetIndexRow(key, out _);
-        bool IReadOnlyDictionary<int, int>.TryGetValue(int key, out int value)
-        {
-            if (TryGetIndexRow(key, out var row)) { value = row.FrequencyRank; return true; }
-            value = default; return false;
-        }
+        int IReadOnlyDictionary<int, int>.this[int key] => TryGetKnownFrequencyRank(key, out var rank) ? rank : throw new KeyNotFoundException();
+        bool IReadOnlyDictionary<int, int>.ContainsKey(int key) => TryGetKnownFrequencyRank(key, out _);
+        bool IReadOnlyDictionary<int, int>.TryGetValue(int key, out int value) => TryGetKnownFrequencyRank(key, out value);
         IEnumerator<KeyValuePair<int, int>> IEnumerable<KeyValuePair<int, int>>.GetEnumerator()
         {
             using var connection = OpenReadConnection();
             using var command = connection.CreateCommand();
-            command.CommandText = "SELECT word_id,frequency_rank FROM word_index ORDER BY word_id;";
+            command.CommandText = "SELECT word_id,frequency_rank FROM word_index WHERE frequency_rank<>$unknown ORDER BY word_id;";
+            command.Parameters.AddWithValue("$unknown", UnknownOfflineFrequencyRank);
             using var reader = command.ExecuteReader();
             while (reader.Read()) yield return new KeyValuePair<int, int>(reader.GetInt32(0), reader.GetInt32(1));
         }
@@ -1079,7 +1157,8 @@ CREATE TABLE IF NOT EXISTS word_index (word_id INTEGER PRIMARY KEY, frequency_ra
         {
             using var connection = OpenReadConnection();
             using var command = connection.CreateCommand();
-            command.CommandText = "SELECT word_id FROM word_index ORDER BY word_id;";
+            command.CommandText = "SELECT word_id FROM word_index WHERE frequency_rank<>$unknown ORDER BY word_id;";
+            command.Parameters.AddWithValue("$unknown", UnknownOfflineFrequencyRank);
             using var reader = command.ExecuteReader();
             while (reader.Read()) yield return reader.GetInt32(0);
         }
@@ -1087,7 +1166,8 @@ CREATE TABLE IF NOT EXISTS word_index (word_id INTEGER PRIMARY KEY, frequency_ra
         {
             using var connection = OpenReadConnection();
             using var command = connection.CreateCommand();
-            command.CommandText = "SELECT COUNT(*) FROM word_index;";
+            command.CommandText = "SELECT COUNT(*) FROM word_index WHERE frequency_rank<>$unknown;";
+            command.Parameters.AddWithValue("$unknown", UnknownOfflineFrequencyRank);
             return Convert.ToInt32(command.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture);
         }
     }
